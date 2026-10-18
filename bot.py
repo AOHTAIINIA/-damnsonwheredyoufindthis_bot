@@ -16,19 +16,23 @@ from aiogram.types import (
 )
 
 # =====================================================================
-# ⚙️ 1. НАСТРОЙКИ ТОКЕНА И ПОДКЛЮЧЕНИЯ (BOTHOST + ЛОКАЛЬНЫЙ ПРОКСИ)
+# ⚙️ 1. АВТОМАТИЧЕСКОЕ ПОЛУЧЕНИЕ ТОКЕНА С BOTHOST.RU
 # =====================================================================
-# На Bothost.ru токен подхватится сам из поля Bot Token / Переменных окружения.
-# Для запуска на домашнем ПК можно вписать токен во вторые кавычки:
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or "8669029978:AAGFh4c1zsXDa4Hw8RI-N-5n8Ve3a_tPJDY"
-
-# Сначала пробуем прямое подключение (для сервера в Нидерландах на Bothost),
-# а если не вышло — проверяем локальный порт 1337 (для домашнего ПК)
-PROXY_CANDIDATES = [
-    None,
-    "socks5://127.0.0.1:1337",
-    "http://127.0.0.1:1337",
-]
+# Ничего вписывать сюда НЕ НУЖНО! Хостинг Bothost сам подставит сюда
+# токен из поля "Bot Token", которое ты заполнил на сайте.
+def get_host_token() -> str:
+    for env_key in ("BOT_TOKEN", "TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN"):
+        val = os.getenv(env_key)
+        if val and ":" in val:
+            return val.strip()
+    # Резервный поиск: если хостинг назвал переменную нестандартно, ищем по формату токена
+    for k, v in os.environ.items():
+        if isinstance(v, str) and re.match(r"^\d{8,12}:[A-Za-z0-9_-]{30,40}$", v.strip()):
+            return v.strip()
+    raise RuntimeError(
+        "❌ Токен не найден в настройках хостинга! "
+        "Убедись, что поле 'Bot Token' заполнено в панели управления на сайте Bothost.ru"
+    )
 
 dp = Dispatcher()
 bot: Bot = None
@@ -305,7 +309,6 @@ def get_user(uid: str):
 
 
 async def safe_answer(message: types.Message, text: str, reply_markup=None):
-    """Безопасная отправка: если в тексте сломана разметка Markdown, отправляет обычным текстом без ошибки."""
     try:
         return await message.answer(text, reply_markup=reply_markup, parse_mode="Markdown")
     except Exception:
@@ -336,7 +339,6 @@ def split_into_paragraphs(text: str) -> list:
 
 
 def parse_md_content(raw_text: str) -> list:
-    """Парсит как экспорт чата Gemini (chat.md с Turn / Пользователь / Ассистент), так и обычные .md файлы."""
     extracted = []
     if "### 👤 Пользователь" in raw_text or "### 🤖 Ассистент" in raw_text:
         turns = re.split(r"## Turn \d+", raw_text)
@@ -344,7 +346,6 @@ def parse_md_content(raw_text: str) -> list:
             if not turn.strip():
                 continue
             parts = re.split(r"### (👤 Пользователь|🤖 Ассистент)", turn)
-            # parts: [header, role1, text1, role2, text2...]
             for idx in range(1, len(parts) - 1, 2):
                 role_label = parts[idx]
                 content = parts[idx + 1].strip()
@@ -358,7 +359,6 @@ def parse_md_content(raw_text: str) -> list:
 
 
 def parse_json_content(raw_text: str) -> list:
-    """Поддерживает формат gemini-voyager (items), AI Studio (chunkedPrompt) и стандартный список."""
     data = json.loads(raw_text)
     extracted = []
     if isinstance(data, dict) and "items" in data:
@@ -380,7 +380,6 @@ def parse_json_content(raw_text: str) -> list:
 
 
 def build_markdown_export(history: list) -> str:
-    """Собирает всю историю в красивый .md файл в формате Gemini Chat."""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
         "# Экспорт курса по геймдизайну в Roblox (ИИ-Комбайн)",
@@ -771,7 +770,6 @@ async def load_document_file(message: types.Message):
     doc = message.document
     fname = (doc.file_name or "").lower()
 
-    # Если картинку скинули файлом без сжатия
     if fname.endswith((".png", ".jpg", ".jpeg", ".webp")):
         u = get_user(str(message.from_user.id))
         caption = message.caption or f"Скриншот-файл {doc.file_name}"
@@ -801,7 +799,7 @@ async def load_document_file(message: types.Message):
             fmt_label = "Markdown / TXT"
 
         if not extracted:
-            await message.answer(f"⚠️ Файл прочитан, но внутри не найдено текстовых блоков.")
+            await message.answer("⚠️ Файл прочитан, но внутри не найдено текстовых блоков.")
             return
 
         u = get_user(str(message.from_user.id))
@@ -1007,41 +1005,17 @@ async def clear_all(message: types.Message, state: FSMContext):
 
 
 # =====================================================================
-# 🔌 11. АВТО-ПОДБОР РАБОЧЕГО КАНАЛА СВЯЗИ И ЗАПУСК
+# 🔌 11. ЗАПУСК НА BOTHOST.RU
 # =====================================================================
-async def create_working_bot() -> Bot:
-    for proxy in PROXY_CANDIDATES:
-        label = proxy if proxy else "Прямое соединение (Облако / Без прокси)"
-        print(f"🔄 Пробую подключиться к Telegram через: {label} ...")
-        test_bot = None
-        try:
-            if proxy:
-                session_client = AiohttpSession(proxy=proxy, timeout=10)
-            else:
-                session_client = AiohttpSession(timeout=10)
-                session_client._connector_init["family"] = socket.AF_INET
-
-            test_bot = Bot(token=BOT_TOKEN, session=session_client)
-            me = await test_bot.get_me()
-            print(f"✅ УСПЕХ! Бот @{me.username} подключился через: {label}")
-            return test_bot
-        except Exception as e:
-            print(f"⚠️ Не подошло ({label}): {e}")
-            if test_bot:
-                try:
-                    await test_bot.session.close()
-                except Exception:
-                    pass
-
-    raise RuntimeError(
-        "❌ Ни один способ подключения не сработал! Проверь правильность BOT_TOKEN."
-    )
-
-
 async def main():
     global bot
-    bot = await create_working_bot()
-    print("⚡ ИИ-Комбайн 3.0 готов к работе! Жми /start в Telegram.")
+    token = get_host_token()
+    session_client = AiohttpSession(timeout=15)
+    session_client._connector_init["family"] = socket.AF_INET
+
+    bot = Bot(token=token, session=session_client)
+    me = await bot.get_me()
+    print(f"✅ УСПЕХ! Бот @{me.username} запущен на Bothost.ru!")
     await dp.start_polling(bot)
 
 
