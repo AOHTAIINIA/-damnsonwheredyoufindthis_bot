@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import json
 import os
@@ -54,30 +55,30 @@ def get_host_token() -> str:
         if isinstance(v, str) and re.match(r"^\d{8,12}:[A-Za-z0-9_-]{30,40}$", v.strip()):
             return v.strip()
     raise RuntimeError(
-        "❌ Токен не найден! Вставь новый токен от @BotFather в поле 'Bot Token' на сайте Bothost.ru"
+        "❌ Токен бота не найден! Вставь токен от @BotFather в поле 'Bot Token' на сайте Bothost.ru"
     )
 
 
 dp = Dispatcher()
 bot: Bot = None
 
-# Стандартные названия кнопок и описаний (каждый пользователь может поменять их под себя в боте!)
+# Стандартные названия кнопок и описаний (каждый пользователь может менять их под себя в боте)
 DEFAULT_UI = {
     "welcome_title": "⚡ Персональный Хаб и Дамп Проектов",
-    "welcome_desc": "Все твои проекты, дампы файлов и личные коды привязаны к твоему аккаунту. Закидывай любые файлы прямо в чат — они сохранятся в активный проект.",
+    "welcome_desc": "Все твои проекты, дампы файлов, ключи и личные коды привязаны только к твоему аккаунту. Закидывай любые файлы прямо в чат — они сохранятся в активный проект.",
     "btn_projects": "📁 Мои проекты",
     "btn_dump": "🗄 Дамп файлов",
     "btn_reader": "📑 Читалка дампа",
     "btn_codes": "💻 База кодов",
     "btn_ai": "🤖 ИИ-Чат (по Дампу)",
-    "btn_keys": "🔑 Ключи Gemini",
+    "btn_keys": "🔑 Мои ключи API",
     "btn_search": "🔍 Поиск по базе",
     "btn_settings": "⚙️ Настройки кнопок"
 }
 
 
 # =====================================================================
-# 🗄 2. БАЗА ДАННЫХ (ПРИВЯЗКА К ПОЛЬЗОВАТЕЛЮ + ОБЩИЕ КОДЫ)
+# 🗄 2. БАЗА ДАННЫХ (ПРИВЯЗКА К ПОЛЬЗОВАТЕЛЮ + ДОСТУПНЫЕ КОДЫ)
 # =====================================================================
 def load_db() -> dict:
     if os.path.exists(DB_FILE):
@@ -90,9 +91,7 @@ def load_db() -> dict:
             print(f"⚠️ Ошибка чтения БД: {e}")
     return {
         "users": {},
-        "public_codes": [],      # Общая база кодов, доступная всем пользователям
-        "shared_api_keys": [],   # Общий пул ключей Gemini (на 4+ аккаунта)
-        "key_cursor": 0
+        "public_codes": []  # Общая база кодов, куда пользователи сами публикуют скрипты
     }
 
 
@@ -122,21 +121,25 @@ def get_user(user_obj: types.User) -> dict:
                     "name": "Основной проект",
                     "desc": "Чистый проект для файлов и заметок",
                     "created": datetime.now().strftime("%d.%m.%Y"),
-                    "files": [],         # Все загруженные файлы и их текстовый дамп
-                    "active_file": 0,    # Индекс открытого файла в читалке
-                    "curr_page": 0,      # Текущий шаг/страница в читалке
-                    "ai_history": []     # История диалога с ИИ внутри этого проекта
+                    "files": [],
+                    "active_file": 0,
+                    "curr_page": 0,
+                    "ai_history": []
                 }
             },
-            "my_codes": [],              # Личные коды пользователя (чисто с нуля!)
-            "personal_keys": []          # Личные ключи Gemini пользователя
+            "my_codes": [],
+            "personal_keys": [],
+            "key_cursor": 0
         }
         save_db()
-    # Подстраховка при обновлениях структуры
     u = db["users"][uid]
     for k, v in DEFAULT_UI.items():
         if k not in u.get("ui", {}):
             u.setdefault("ui", {})[k] = v
+    if "personal_keys" not in u:
+        u["personal_keys"] = []
+    if "key_cursor" not in u:
+        u["key_cursor"] = 0
     return u
 
 
@@ -163,7 +166,7 @@ def get_active_project(u: dict) -> dict:
 
 
 # =====================================================================
-# 🛠 3. ИЗВЛЕЧЕНИЕ ТЕКСТА ИЗ ФАЙЛОВ АЛГОРИТМИКИ (.MD, .PDF, .DOCX, .PPTX, .JSON)
+# 🛠 3. ИЗВЛЕЧЕНИЕ ТЕКСТА ИЗ ФАЙЛОВ (.MD, .PDF, .DOCX, .PPTX, .JSON)
 # =====================================================================
 async def safe_answer(message: types.Message, text: str, reply_markup=None):
     try:
@@ -181,7 +184,7 @@ async def safe_edit(message: types.Message, text: str, reply_markup=None):
 
 def split_into_pages(text: str, chunk_size: int = 700) -> list:
     if not text or not text.strip():
-        return ["(В этом файле нет текстового содержимого — только бинарный оригинал для скачивания)"]
+        return ["(В этом файле нет текстового содержимого — только оригинал для скачивания)"]
     raw_blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
     merged = []
     buffer = ""
@@ -204,11 +207,9 @@ def split_into_pages(text: str, chunk_size: int = 700) -> list:
 
 def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
     fname = filename.lower()
-    # 1. Текстовые файлы, Markdown и скрипты
     if fname.endswith((".md", ".txt", ".lua", ".luau", ".py", ".csv", ".html", ".xml", ".js")):
         return file_bytes.decode("utf-8", errors="ignore").strip()
 
-    # 2. JSON-файлы (чаты Gemini, конфиги, дампы)
     if fname.endswith(".json"):
         raw = file_bytes.decode("utf-8", errors="ignore")
         try:
@@ -229,7 +230,6 @@ def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
             pass
         return raw[:50000]
 
-    # 3. PDF-файлы (методички и презентации)
     if fname.endswith(".pdf") and PdfReader is not None:
         try:
             reader = PdfReader(io.BytesIO(file_bytes))
@@ -242,7 +242,6 @@ def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
         except Exception as e:
             return f"[Ошибка чтения PDF: {e}]"
 
-    # 4. Word (.docx) методички
     if fname.endswith(".docx") and docx is not None:
         try:
             doc = docx.Document(io.BytesIO(file_bytes))
@@ -256,7 +255,6 @@ def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
         except Exception as e:
             return f"[Ошибка чтения DOCX: {e}]"
 
-    # 5. PowerPoint (.pptx) презентации
     if fname.endswith(".pptx") and Presentation is not None:
         try:
             prs = Presentation(io.BytesIO(file_bytes))
@@ -276,19 +274,9 @@ def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
 
 
 # =====================================================================
-# 🔑 4. РОТАТОР КЛЮЧЕЙ GEMINI API (4+ АККАУНТА) + ЧАТ ПО ДАМПУ ПРОЕКТА
+# 🔑 4. ЛИЧНЫЙ РОТАТОР КЛЮЧЕЙ API (ПОДДЕРЖКА AQ.Ab8..., AIza... И ДР.)
 # =====================================================================
-def get_available_keys(u: dict) -> list:
-    # Сначала личные ключи пользователя, затем общие ключи из пула
-    keys = list(u.get("personal_keys", []))
-    for k in db.get("shared_api_keys", []):
-        if k not in keys:
-            keys.append(k)
-    return keys
-
-
 def build_project_context(proj: dict, u: dict, max_chars: int = 120000) -> str:
-    """Собирает весь текстовый дамп проекта + коды для отправки в контекст Gemini."""
     parts = [f"=== АКТИВНЫЙ ПРОЕКТ: {proj['name']} ===\nОписание: {proj.get('desc', '')}\n"]
 
     if proj.get("files"):
@@ -298,7 +286,7 @@ def build_project_context(proj: dict, u: dict, max_chars: int = 120000) -> str:
             if extracted:
                 parts.append(f"\n--- ФАЙЛ #{idx}: {fitem['name']} ---\n{extracted[:25000]}")
             else:
-                parts.append(f"\n--- ФАЙЛ #{idx}: {fitem['name']} (Бинарный файл/Скриншот: {fitem.get('caption', '')}) ---")
+                parts.append(f"\n--- ФАЙЛ #{idx}: {fitem['name']} (Описание: {fitem.get('caption', '')}) ---")
 
     if u.get("my_codes"):
         parts.append("\n=== ЛИЧНЫЕ КОДЫ И СКРИПТЫ ПОЛЬЗОВАТЕЛЯ ===")
@@ -310,12 +298,12 @@ def build_project_context(proj: dict, u: dict, max_chars: int = 120000) -> str:
 
 
 async def ask_gemini_with_rotation(u: dict, proj: dict, user_prompt: str, photo_bytes: bytes = None) -> str:
-    keys = get_available_keys(u)
+    keys = u.get("personal_keys", [])
     if not keys:
         return (
-            "⚠️ *Не добавлено ни одного API-ключа Gemini!*\n\n"
-            "Открой меню `🔑 Ключи Gemini` и добавь 1–4 бесплатных ключа из Google AI Studio (`aistudio.google.com`), "
-            "чтобы общаться с нейросетью прямо внутри бота по всему своему дампу файлов."
+            "⚠️ *У тебя пока не добавлено ни одного API-ключа!*\n\n"
+            "Открой меню `🔑 Мои ключи API` и отправь туда свои ключи (1–4 шт.), "
+            "чтобы общаться с ИИ прямо внутри бота по всему своему дампу файлов."
         )
 
     context_dump = build_project_context(proj, u)
@@ -326,7 +314,6 @@ async def ask_gemini_with_rotation(u: dict, proj: dict, user_prompt: str, photo_
         f"{context_dump}"
     )
 
-    # Формируем историю последних сообщений проекта
     contents = []
     for h in proj.get("ai_history", [])[-8:]:
         role = "user" if h["role"] == "user" else "model"
@@ -334,7 +321,6 @@ async def ask_gemini_with_rotation(u: dict, proj: dict, user_prompt: str, photo_
 
     user_parts = [{"text": user_prompt}]
     if photo_bytes:
-        import base64
         b64_img = base64.b64encode(photo_bytes).decode("utf-8")
         user_parts.append({
             "inline_data": {
@@ -353,59 +339,60 @@ async def ask_gemini_with_rotation(u: dict, proj: dict, user_prompt: str, photo_
     models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash"]
     errors_log = []
 
-    start_idx = db.get("key_cursor", 0) % len(keys)
+    start_idx = u.get("key_cursor", 0) % len(keys)
     ordered_keys = keys[start_idx:] + keys[:start_idx]
 
     async with aiohttp.ClientSession() as session:
         for k_offset, api_key in enumerate(ordered_keys):
             key_num = ((start_idx + k_offset) % len(keys)) + 1
             for model_name in models_to_try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-                try:
-                    async with session.post(url, json=payload, timeout=45) as resp:
-                        data = await resp.json()
-                        if resp.status == 200 and "candidates" in data:
-                            # Сдвигаем курсор на следующий аккаунт для равномерной ротации 4 ключей
-                            db["key_cursor"] = (start_idx + k_offset + 1) % len(keys)
-                            save_db()
-                            text_ans = data["candidates"][0]["content"]["parts"][0]["text"]
-                            return f"🤖 _(Ключ #{key_num} • {model_name} • Дамп: {len(proj['files'])} файл.)_\n\n{text_ans}"
-                        else:
-                            err_msg = data.get("error", {}).get("message", f"HTTP {resp.status}")
-                            errors_log.append(f"Ключ #{key_num} ({model_name}): {err_msg[:80]}")
-                            # Если ошибка 429 (лимит квоты) или 403 — сразу пробуем следующий ключ
-                            if resp.status in (429, 400, 403):
-                                break
-                except Exception as e:
-                    errors_log.append(f"Ключ #{key_num}: {str(e)[:60]}")
-                    break
+                base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
 
-    return "❌ *Все ключи в пуле вернули ошибку или исчерпали лимит:*\n" + "\n".join(errors_log[:5])
+                # Пробуем сначала стандартную передачу ключа (?key= + x-goog-api-key),
+                # а если ключ вида AQ.Ab8... / OAuth — также пробуем Bearer-авторизацию
+                auth_variants = [
+                    (f"{base_url}?key={api_key}", {"Content-Type": "application/json", "x-goog-api-key": api_key}),
+                    (base_url, {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
+                ]
+
+                for req_url, req_headers in auth_variants:
+                    try:
+                        async with session.post(req_url, json=payload, headers=req_headers, timeout=45) as resp:
+                            data = await resp.json()
+                            if resp.status == 200 and "candidates" in data:
+                                u["key_cursor"] = (start_idx + k_offset + 1) % len(keys)
+                                save_db()
+                                text_ans = data["candidates"][0]["content"]["parts"][0]["text"]
+                                return f"🤖 _(Ключ #{key_num} • {model_name} • Дамп: {len(proj['files'])} файл.)_\n\n{text_ans}"
+                            else:
+                                err_msg = data.get("error", {}).get("message", f"HTTP {resp.status}")
+                                errors_log.append(f"Ключ #{key_num}: {err_msg[:75]}")
+                                if resp.status == 429:
+                                    break
+                    except Exception as e:
+                        errors_log.append(f"Ключ #{key_num}: {str(e)[:60]}")
+                        break
+
+    unique_errs = list(dict.fromkeys(errors_log))[:4]
+    return "❌ *Не удалось получить ответ от API:*\n" + "\n".join(unique_errs)
 
 
 # =====================================================================
 # 🎛 5. КЛАВИАТУРА И СОСТОЯНИЯ (С ЗАЩИТОЙ ОТ ЗАВИСАНИЯ МЕНЮ)
 # =====================================================================
 class HubStates(StatesGroup):
-    # Проекты
     new_proj_name = State()
     new_proj_desc = State()
     rename_proj = State()
-    # Читалка дампа (редактирование текста файла)
     edit_page_text = State()
     add_text_note = State()
-    # База кодов (Личные + Общие)
     code_title = State()
     code_desc = State()
     code_body = State()
     code_edit_val = State()
-    # ИИ-Чат по дампу
     ai_chat_mode = State()
-    # Ключи Gemini
     add_api_key = State()
-    # Поиск
     search_query = State()
-    # Настройки кнопок и текстов
     edit_ui_val = State()
 
 
@@ -437,7 +424,7 @@ async def cancel_state_cb(callback: types.CallbackQuery, state: FSMContext):
 
 
 # =====================================================================
-# 🛡 6. ГЛАВНЫЙ ПЕРЕХВАТЧИК КНОПОК МЕНЮ (РАБОТАЕТ В ЛЮБОМ СОСТОЯНИИ!)
+# 🛡 6. ГЛАВНЫЙ ПЕРЕХВАТЧИК КНОПОК МЕНЮ (НЕ ДАЁТ БОТУ ЗАВИСНУТЬ)
 # =====================================================================
 @dp.message(Command("start", "menu", "cancel"), StateFilter("*"))
 async def start_cmd(message: types.Message, state: FSMContext):
@@ -445,7 +432,7 @@ async def start_cmd(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     proj = get_active_project(u)
     ui = u["ui"]
-    keys_count = len(get_available_keys(u))
+    keys_count = len(u.get("personal_keys", []))
 
     await safe_answer(
         message,
@@ -455,7 +442,7 @@ async def start_cmd(message: types.Message, state: FSMContext):
         f"📁 *Активный проект:* `{proj['name']}`\n"
         f"🗄 *Файлов в дампе проекта:* *{len(proj['files'])}*\n"
         f"💻 *Кодов:* Моих: *{len(u['my_codes'])}* | Доступных всем: *{len(db['public_codes'])}*\n"
-        f"🔑 *Активных ключей Gemini в пуле:* *{keys_count}*",
+        f"🔑 *Моих ключей API в ротации:* *{keys_count}*",
         reply_markup=get_main_kb(u)
     )
 
@@ -469,7 +456,6 @@ def is_menu_button(message: types.Message) -> bool:
 
 @dp.message(is_menu_button, StateFilter("*"))
 async def handle_any_menu_button(message: types.Message, state: FSMContext):
-    """Перехватывает нажатие любой нижней кнопки даже внутри незавершённого ввода, чтобы бот НИКОГДА не зависал!"""
     await state.clear()
     u = get_user(message.from_user)
     ui = u["ui"]
@@ -499,7 +485,7 @@ async def handle_any_menu_button(message: types.Message, state: FSMContext):
 
 
 # =====================================================================
-# 📁 7. МОИ ПРОЕКТЫ (ЛИЧНЫЕ ПАПКИ ПОД КУРСЫ И ЗАДАЧИ)
+# 📁 7. МОИ ПРОЕКТЫ (ЛИЧНЫЕ ПАПКИ ПОЛЬЗОВАТЕЛЯ)
 # =====================================================================
 async def open_projects_menu(message: types.Message, u: dict):
     proj = get_active_project(u)
@@ -630,7 +616,7 @@ async def exp_proj_cb(callback: types.CallbackQuery):
 
 
 # =====================================================================
-# 🗄 8. ДАМП ХРАНЕНИЯ ФАЙЛОВ (МАССОВАЯ ЗАГРУЗКА ЛЮБЫХ ФАЙЛОВ И СКРИНОВ)
+# 🗄 8. ДАМП ХРАНЕНИЯ ФАЙЛОВ
 # =====================================================================
 async def open_dump_menu(message: types.Message, u: dict):
     proj = get_active_project(u)
@@ -655,8 +641,8 @@ async def open_dump_menu(message: types.Message, u: dict):
         f"🗄 *ДАМП ФАЙЛОВ ПРОЕКТА «{proj['name']}»*\n\n"
         f"Всего загружено файлов: *{len(proj['files'])}*\n"
         f"• *Как загрузить:* просто выдели и отправь в этот чат сколько угодно файлов (`.pdf`, `.docx`, `.pptx`, `.md`, `.json`, `.txt`, `.rbxl`, `.zip` или скриншотов).\n"
-        f"• Текст из документов автоматически индексируется для ИИ-чата и читалки.\n"
-        f"• Нажми на файл ниже, чтобы открыть его в читалке, `📥` — чтобы скачать оригинал:",
+        f"• Текст из документов автоматически извлекается для ИИ-чата и читалки.\n"
+        f"• Нажми на файл ниже, чтобы читать его по шагам, или `📥` — чтобы скачать оригинал:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
 
@@ -669,7 +655,6 @@ async def handle_any_document_dump(message: types.Message, state: FSMContext):
     fname = doc.file_name or f"file_{len(proj['files'])+1}"
 
     extracted_text = ""
-    # Скачиваем и индексируем текст, если файл до 20 МБ и текстового/офисного формата
     if doc.file_size and doc.file_size < 19 * 1024 * 1024:
         if fname.lower().endswith((".md", ".txt", ".json", ".lua", ".luau", ".py", ".csv", ".pdf", ".docx", ".pptx", ".html")):
             try:
@@ -716,7 +701,6 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
     photo = message.photo[-1]
     caption = message.caption or f"Скриншот #{len(proj['files'])+1}"
 
-    # Если пользователь сейчас находится в режиме ИИ-чата — сразу отправляем скриншот в Gemini Vision!
     curr_state = await state.get_state()
     if curr_state == HubStates.ai_chat_mode.state:
         wait_msg = await message.answer("⏳ Анализирую скриншот с учётом дампа проекта...")
@@ -739,7 +723,7 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
     save_db()
     idx = len(proj["files"]) - 1
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤖 Разebрать этот скриншот через ИИ", callback_data=f"fvision_{idx}")]
+        [InlineKeyboardButton(text="🤖 Разобрать этот скриншот через ИИ", callback_data=f"fvision_{idx}")]
     ])
     await safe_answer(
         message,
@@ -839,7 +823,7 @@ async def add_text_note_done(message: types.Message, state: FSMContext):
 
 
 # =====================================================================
-# 📑 9. ЧИТАЛКА И РЕДАКТОР ДАМПА ПО СТРАНИЦАМ / АБЗАЦАМ
+# 📑 9. ЧИТАЛКА И РЕДАКТОР ДАМПА ПО СТРАНИЦАМ
 # =====================================================================
 async def open_reader_menu(message: types.Message, u: dict):
     proj = get_active_project(u)
@@ -961,7 +945,7 @@ async def reader_edit_page_done(message: types.Message, state: FSMContext):
 
 
 # =====================================================================
-# 💻 10. БАЗА КОДОВ (ЛИЧНЫЕ ПОЛЬЗОВАТЕЛЯ + ОБЩИЕ ДОСТУПНЫЕ ВСЕМ)
+# 💻 10. БАЗА КОДОВ (ЛИЧНЫЕ ПОЛЬЗОВАТЕЛЯ + ДОСТУПНЫЕ ВСЕМ)
 # =====================================================================
 async def open_codes_menu(message: types.Message, u: dict, tab: str = "my"):
     buttons = []
@@ -1095,7 +1079,6 @@ async def toggle_code_public_cb(callback: types.CallbackQuery):
     if 0 <= idx < len(u["my_codes"]):
         c = u["my_codes"][idx]
         c["is_public"] = not c.get("is_public", False)
-        # Синхронизируем с общей базой public_codes
         db["public_codes"] = [x for x in db["public_codes"] if x.get("id") != c["id"]]
         if c["is_public"]:
             db["public_codes"].append(dict(c))
@@ -1127,7 +1110,6 @@ async def edit_my_code_done(message: types.Message, state: FSMContext):
     if 0 <= idx < len(u["my_codes"]) and message.text:
         c = u["my_codes"][idx]
         c[field] = message.text.strip()
-        # Если код опубликован — обновляем его и в общей базе
         for pub_c in db["public_codes"]:
             if pub_c.get("id") == c["id"]:
                 pub_c[field] = c[field]
@@ -1192,7 +1174,7 @@ async def fork_public_code_cb(callback: types.CallbackQuery):
 
 
 # =====================================================================
-# 🤖 11. ИИ-ЧАТ ПО ДАМПУ ПРОЕКТА И ПУЛ КЛЮЧЕЙ GEMINI (4+ АККАУНТА)
+# 🤖 11. ИИ-ЧАТ ПО ДАМПУ ПРОЕКТА И ЛИЧНЫЕ КЛЮЧИ API
 # =====================================================================
 async def send_long_text(message: types.Message, text: str):
     if len(text) <= 3900:
@@ -1204,7 +1186,7 @@ async def send_long_text(message: types.Message, text: str):
 
 async def open_ai_chat_mode(message: types.Message, u: dict, state: FSMContext):
     proj = get_active_project(u)
-    keys = get_available_keys(u)
+    keys = u.get("personal_keys", [])
     await state.set_state(HubStates.ai_chat_mode)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧹 Очистить историю диалога с ИИ", callback_data="ai_clear_hist")],
@@ -1212,10 +1194,10 @@ async def open_ai_chat_mode(message: types.Message, u: dict, state: FSMContext):
     ])
     await safe_answer(
         message,
-        f"🤖 *РЕЖИМ ПРЯМОГО ЧАТА С GEMINI ПО ДАМПУ ПРОЕКТА*\n\n"
+        f"🤖 *РЕЖИМ ПРЯМОГО ЧАТА С ИИ ПО ДАМПУ ПРОЕКТА*\n\n"
         f"• *Открытый проект:* `{proj['name']}`\n"
         f"• *Подключено файлов из дампа:* *{len(proj['files'])} шт.*\n"
-        f"• *Ключей в ротации:* *{len(keys)} шт.*\n\n"
+        f"• *Твоих ключей в ротации:* *{len(keys)} шт.*\n\n"
         f"✍️ *Пиши любой вопрос, задачу или скидывай скриншот прямо сюда* — нейросеть уже видит все загруженные в этот проект файлы и коды!\n"
         f"_(Чтобы переключиться в другое меню — просто нажми любую кнопку внизу)_",
         reply_markup=kb
@@ -1244,7 +1226,7 @@ async def handle_ai_chat_message(message: types.Message, state: FSMContext):
     proj = get_active_project(u)
     user_q = message.text.strip()
 
-    wait_msg = await message.answer(f"⏳ Gemini читает дамп «{proj['name']}» ({len(proj['files'])} файл.) и пишет ответ...")
+    wait_msg = await message.answer(f"⏳ Читаю дамп «{proj['name']}» ({len(proj['files'])} файл.) и генерирую ответ...")
     answer_text = await ask_gemini_with_rotation(u, proj, user_q)
     await wait_msg.delete()
 
@@ -1283,40 +1265,31 @@ async def save_last_ai_to_dump_cb(callback: types.CallbackQuery):
 
 async def open_keys_menu(message: types.Message, u: dict):
     p_keys = u.get("personal_keys", [])
-    s_keys = db.get("shared_api_keys", [])
 
     buttons = []
     for idx, k in enumerate(p_keys):
-        masked = f"{k[:8]}...{k[-4:]}"
-        buttons.append([InlineKeyboardButton(text=f"🔒 Личный ключ #{idx+1} ({masked}) — Удалить", callback_data=f"kdel_p_{idx}")])
+        masked = f"{k[:8]}...{k[-4:]}" if len(k) > 14 else k
+        buttons.append([InlineKeyboardButton(text=f"🔑 Ключ #{idx+1} ({masked}) — 🗑 Удалить", callback_data=f"kdel_{idx}")])
 
-    for idx, k in enumerate(s_keys):
-        masked = f"{k[:8]}...{k[-4:]}"
-        buttons.append([InlineKeyboardButton(text=f"🌐 Общий ключ #{idx+1} ({masked}) — Удалить", callback_data=f"kdel_s_{idx}")])
-
-    buttons.append([
-        InlineKeyboardButton(text="➕ Добавить личный ключ", callback_data="kadd_p"),
-        InlineKeyboardButton(text="➕ Добавить в общий пул (на всех)", callback_data="kadd_s")
-    ])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить API-ключ(и)", callback_data="kadd_p")])
+    if p_keys:
+        buttons.append([InlineKeyboardButton(text="🧹 Удалить все ключи", callback_data="kclear_all")])
 
     await safe_answer(
         message,
-        f"🔑 *ПУЛ КЛЮЧЕЙ GEMINI API (АВТО-РОТАЦИЯ 4+ АККАУНТОВ)*\n\n"
-        f"• *Личных ключей:* *{len(p_keys)}*\n"
-        f"• *Общих ключей в пуле:* *{len(s_keys)}*\n\n"
-        f"💡 _Ты можешь создать 4 бесплатных ключа на разных Google-аккаунтах в [Google AI Studio](https://aistudio.google.com/apikey) и закинуть их сюда (по одному или сразу списком через перенос строки). Бот будет автоматически чередовать их по кругу и переключаться при лимитах!_",
+        f"🔑 *МОИ ЛИЧНЫЕ КЛЮЧИ API (АВТО-РОТАЦИЯ)*\n\n"
+        f"• *Привязано ключей к твоему профилю:* *{len(p_keys)} шт.*\n\n"
+        f"💡 _Все ключи здесь привязаны строго к твоему Telegram ID — другие пользователи бота их не видят. Можешь закинуть 1–4 ключа с разных аккаунтов (любого формата: `AQ.Ab8...`, `AIza...` и др.), по одному или списком с новой строки:_",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
 
 
-@dp.callback_query(F.data.in_(["kadd_p", "kadd_s"]))
+@dp.callback_query(F.data == "kadd_p")
 async def add_key_start(callback: types.CallbackQuery, state: FSMContext):
-    ktype = "personal" if callback.data == "kadd_p" else "shared"
-    await state.update_data(ktype=ktype)
     await state.set_state(HubStates.add_api_key)
     await safe_answer(
         callback.message,
-        "🔑 Отправь один или сразу несколько ключей `AIzaSy...` (каждый с новой строки):",
+        "🔑 Отправь один или сразу несколько API-ключей (каждый с новой строки, поддерживается любой формат — `AQ.Ab8...`, `AIza...` и др.):",
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -1324,33 +1297,31 @@ async def add_key_start(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(HubStates.add_api_key)
 async def add_key_done(message: types.Message, state: FSMContext):
-    data = await state.get_data()
     await state.clear()
     u = get_user(message.from_user)
-    ktype = data.get("ktype", "personal")
 
-    raw_lines = [line.strip() for line in (message.text or "").splitlines() if line.strip().startswith("AIza")]
+    # Принимаем любые ключи длиной от 10 символов без привязки к префиксу AIza
+    raw_lines = [line.strip() for line in (message.text or "").splitlines() if len(line.strip()) >= 10]
     if not raw_lines:
-        await safe_answer(message, "⚠️ Ключи Gemini должны начинаться с `AIza...`. Попробуй ещё раз.", reply_markup=get_main_kb(u))
+        await safe_answer(message, "⚠️ Ключ слишком короткий. Отправь корректный API-ключ.", reply_markup=get_main_kb(u))
         return
 
-    target_list = u.setdefault("personal_keys", []) if ktype == "personal" else db.setdefault("shared_api_keys", [])
+    target_list = u.setdefault("personal_keys", [])
     added = 0
     for k in raw_lines:
         if k not in target_list:
             target_list.append(k)
             added += 1
     save_db()
-    await safe_answer(message, f"✅ Добавлено ключей в ротацию: *{added} шт.*!", reply_markup=get_main_kb(u))
+    await safe_answer(message, f"✅ Добавлено ключей в твой личный пул: *{added} шт.*!", reply_markup=get_main_kb(u))
     await open_keys_menu(message, u)
 
 
 @dp.callback_query(F.data.startswith("kdel_"))
 async def del_key_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
-    _, mode, idx_str = callback.data.split("_")
-    idx = int(idx_str)
-    target = u.get("personal_keys", []) if mode == "p" else db.get("shared_api_keys", [])
+    idx = int(callback.data.replace("kdel_", ""))
+    target = u.get("personal_keys", [])
     if 0 <= idx < len(target):
         target.pop(idx)
         save_db()
@@ -1358,8 +1329,18 @@ async def del_key_cb(callback: types.CallbackQuery):
         await open_keys_menu(callback.message, u)
 
 
+@dp.callback_query(F.data == "kclear_all")
+async def clear_all_keys_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    u["personal_keys"] = []
+    u["key_cursor"] = 0
+    save_db()
+    await callback.answer("Все ключи удалены")
+    await open_keys_menu(callback.message, u)
+
+
 # =====================================================================
-# 🔍 12. УМНЫЙ ПОИСК ПО ДАМПАМ ФАЙЛОВ И КОДАМ
+# 🔍 12. ПОИСК ПО ДАМПАМ ФАЙЛОВ И КОДАМ
 # =====================================================================
 @dp.message(HubStates.search_query)
 async def search_query_done(message: types.Message, state: FSMContext):
@@ -1370,16 +1351,14 @@ async def search_query_done(message: types.Message, state: FSMContext):
         return
 
     found = []
-    # Поиск по всем проектам и файлам пользователя
     for pid, p in u["projects"].items():
-        for f_idx, fitem in enumerate(p["files"]):
+        for fitem in p["files"]:
             txt = fitem.get("extracted_text", "")
             if q in fitem["name"].lower() or q in txt.lower():
                 pos = txt.lower().find(q)
                 snippet = txt[max(0, pos - 60):pos + 140].replace("\n", " ") if pos != -1 else fitem.get("caption", "")
                 found.append(f"📁 *{p['name']}* $\\rightarrow$ 📄 *{fitem['name']}*:\n`...{snippet}...`")
 
-    # Поиск по личным и общим кодам
     for c in u["my_codes"] + db["public_codes"]:
         if q in c["title"].lower() or q in c.get("code", "").lower() or q in c.get("desc", "").lower():
             found.append(f"💻 *Код: {c['title']}*\n_{c.get('desc', '')}_")
@@ -1406,7 +1385,7 @@ UI_LABELS = {
     "btn_reader": "Кнопка 3 (Читалка)",
     "btn_codes": "Кнопка 4 (База кодов)",
     "btn_ai": "Кнопка 5 (ИИ-Чат)",
-    "btn_keys": "Кнопка 6 (Ключи Gemini)",
+    "btn_keys": "Кнопка 6 (Ключи API)",
     "btn_search": "Кнопка 7 (Поиск)",
     "btn_settings": "Кнопка 8 (Настройки)"
 }
