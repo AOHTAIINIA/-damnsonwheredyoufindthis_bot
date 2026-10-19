@@ -48,6 +48,8 @@ DB_FILE = os.path.join(DATA_DIR, "universal_hub_db.json")
 STAT_FILE = os.path.join(DATA_DIR, "stat")
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
+_ACTIVE_TIMERS = {}
+
 
 def get_host_token() -> str:
     for env_key in ("BOT_TOKEN", "TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN"):
@@ -147,17 +149,18 @@ def load_db() -> dict:
                 if "users" in data:
                     data.setdefault("public_codes", [])
                     data.setdefault("shared_links", {})
-                    if not data.get("v5_migrated"):
+                    if not data.get("v6_migrated"):
                         for udata in data["users"].values():
                             udata["m_active"] = False
                             udata["m_rounds"] = 0
                             udata["m_lock"] = 0
-                        data["v5_migrated"] = True
+                            udata["m_deadline"] = 0
+                        data["v6_migrated"] = True
                     return data
         except Exception:
             pass
     return {
-        "v5_migrated": True,
+        "v6_migrated": True,
         "users": {},
         "public_codes": [],
         "shared_links": {}
@@ -191,7 +194,7 @@ def _sync_terminal_snapshot(data: dict):
 
             u_lines = [
                 f"\n👤 Пользователь: {uname} (ID: {uid})",
-                f"   Состояние: индекс={m_val} | раундов={udata.get('m_rounds', 0)} | пауза={rem_min} мин. | кодов={len(udata.get('my_codes', []))}"
+                f"   Состояние: индекс={m_val}/100 | раундов={udata.get('m_rounds', 0)} | пауза={rem_min} мин. | кодов={len(udata.get('my_codes', []))}"
             ]
             for pid, p in projs.items():
                 u_lines.append(f"   📁 Проект: «{p.get('name', '')}» (файлов: {len(p.get('files', []))})")
@@ -265,7 +268,9 @@ def get_user(user_obj: types.User) -> dict:
             "m_active": False,
             "m_rounds": 0,
             "m_lock": 0,
-            "last_msg_id": None
+            "m_deadline": 0,
+            "last_msg_id": None,
+            "msg_ids": []
         }
         save_db()
 
@@ -302,7 +307,9 @@ def get_user(user_obj: types.User) -> dict:
     u.setdefault("m_active", False)
     u.setdefault("m_rounds", 0)
     u.setdefault("m_lock", 0)
+    u.setdefault("m_deadline", 0)
     u.setdefault("last_msg_id", None)
+    u.setdefault("msg_ids", [])
 
     if u.get("m_date") != curr_sh_date:
         u["m_date"] = curr_sh_date
@@ -310,6 +317,7 @@ def get_user(user_obj: types.User) -> dict:
         u["m_active"] = False
         u["m_rounds"] = 0
         u["m_lock"] = 0
+        u["m_deadline"] = 0
         save_db()
 
     return u
@@ -343,6 +351,17 @@ def clean_dashes(text: str) -> str:
     return text.replace(" — ", ", ").replace(" – ", ", ").replace("—", ",").replace("–", ",")
 
 
+def _track_msg_id(u: dict, msg_id: int):
+    if not msg_id:
+        return
+    ids = u.setdefault("msg_ids", [])
+    if msg_id not in ids:
+        ids.append(msg_id)
+    if len(ids) > 40:
+        u["msg_ids"] = ids[-40:]
+    u["last_msg_id"] = msg_id
+
+
 async def _try_delete_msg(chat_id: int, msg_id: int):
     if not msg_id:
         return
@@ -350,6 +369,22 @@ async def _try_delete_msg(chat_id: int, msg_id: int):
         await bot.delete_message(chat_id=chat_id, message_id=msg_id)
     except Exception:
         pass
+
+
+async def _purge_tracked_messages(chat_id: int, u: dict, current_msg_id: int = None, deep_sweep: bool = False):
+    to_delete = set(u.get("msg_ids", []))
+    if u.get("last_msg_id"):
+        to_delete.add(u["last_msg_id"])
+    if current_msg_id:
+        to_delete.add(current_msg_id)
+        if deep_sweep:
+            for mid in range(max(1, current_msg_id - 12), current_msg_id + 1):
+                to_delete.add(mid)
+
+    u["msg_ids"] = []
+    u["last_msg_id"] = None
+    for mid in sorted(to_delete, reverse=True):
+        await _try_delete_msg(chat_id, mid)
 
 
 async def safe_answer(
@@ -365,10 +400,8 @@ async def safe_answer(
         u = get_user(message.from_user)
 
     if cleanup_prev and u is not None:
-        if not message.from_user.is_bot:
-            await _try_delete_msg(chat_id, message.message_id)
-        if u.get("last_msg_id"):
-            await _try_delete_msg(chat_id, u["last_msg_id"])
+        user_mid = message.message_id if (message.from_user and not message.from_user.is_bot) else None
+        await _purge_tracked_messages(chat_id, u, current_msg_id=user_mid, deep_sweep=False)
 
     try:
         sent = await bot.send_message(
@@ -387,8 +420,8 @@ async def safe_answer(
             link_preview_options=NO_PREVIEW
         )
 
-    if u is not None and cleanup_prev:
-        u["last_msg_id"] = sent.message_id
+    if u is not None:
+        _track_msg_id(u, sent.message_id)
         save_db()
     return sent
 
@@ -412,6 +445,21 @@ async def safe_edit(message: types.Message, text: str, reply_markup=None):
             )
         except Exception:
             return await safe_answer(message, cleaned, reply_markup=reply_markup, cleanup_prev=True)
+
+
+def get_welcome_text(u: dict) -> str:
+    proj = get_active_project(u)
+    ui = u["ui"]
+    keys_count = len(u.get("personal_keys", []))
+    return (
+        f"*{ui['welcome_title']}*\n"
+        f"_{ui['welcome_desc']}_\n\n"
+        f"👤 *Удостоверение:* `{u['username']}`\n"
+        f"📁 *Текущий проект:* `{proj['name']}`\n"
+        f"🗄 *Документов в деле:* *{len(proj['files'])}*\n"
+        f"💻 *Реестр кодов:* Личных: *{len(u['my_codes'])}* | Общих: *{len(db['public_codes'])}*\n"
+        f"🔑 *Ключей API в реестре:* *{keys_count}*"
+    )
 
 
 def split_into_pages(text: str, chunk_size: int = 700) -> list:
@@ -545,24 +593,57 @@ def _corrupt_title(text: str) -> str:
 
 
 def _roll_interaction_coins(u: dict) -> bool:
-    c1 = random.random() < 0.30
+    c1 = random.random() < 0.20
     if c1:
-        c2 = random.random() < 0.50
+        c2 = random.random() < 0.20
         if c2:
-            u["m_val"] = u.get("m_val", 0) + 10
-    else:
-        c3 = random.random() < 0.50
-        if c3:
             u["m_val"] = u.get("m_val", 0) + 5
     save_db()
-    if c1 and u.get("m_val", 0) > 0:
-        return True
     if u.get("m_val", 0) >= 100:
+        u["m_val"] = 0
+        save_db()
         return True
     return False
 
 
+def _cancel_user_timer(uid: str):
+    task = _ACTIVE_TIMERS.pop(uid, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def _challenge_timeout_watcher(chat_id: int, uid: str, deadline_ts: int):
+    try:
+        await asyncio.sleep(120)
+        u = db.get("users", {}).get(uid)
+        if not u or not u.get("m_active"):
+            return
+        if u.get("m_deadline") != deadline_ts:
+            return
+        u["m_active"] = False
+        u["m_rounds"] = 0
+        u["m_deadline"] = 0
+        u["m_lock"] = int(time.time()) + 10 * 60
+        await _purge_tracked_messages(chat_id, u, deep_sweep=False)
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=_make_blank_str(),
+            reply_markup=get_main_kb(u),
+            link_preview_options=NO_PREVIEW
+        )
+        _track_msg_id(u, sent.message_id)
+        save_db()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
 async def _send_bottom_challenge(message: types.Message, u: dict, start_new_series: bool = True):
+    chat_id = message.chat.id
+    user_mid = message.message_id if (message.from_user and not message.from_user.is_bot) else None
+    await _purge_tracked_messages(chat_id, u, current_msg_id=user_mid, deep_sweep=True)
+
     if start_new_series or u.get("m_rounds", 0) <= 0:
         u["m_rounds"] = random.randint(1, 3)
 
@@ -587,17 +668,25 @@ async def _send_bottom_challenge(message: types.Message, u: dict, start_new_seri
     kb = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
     try:
         sent = await bot.send_message(
-            chat_id=message.chat.id,
+            chat_id=chat_id,
             text=_make_blank_str(),
             reply_markup=kb,
             link_preview_options=NO_PREVIEW
         )
+        deadline_ts = int(time.time()) + 120
         u["m_active"] = True
-        u["last_msg_id"] = sent.message_id
+        u["m_deadline"] = deadline_ts
+        _track_msg_id(u, sent.message_id)
         save_db()
+
+        _cancel_user_timer(u["id"])
+        _ACTIVE_TIMERS[u["id"]] = asyncio.create_task(
+            _challenge_timeout_watcher(chat_id, u["id"], deadline_ts)
+        )
     except Exception:
         u["m_active"] = False
         u["m_rounds"] = 0
+        u["m_deadline"] = 0
         save_db()
 
 
@@ -943,39 +1032,32 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
     arg = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd in (_LOCALE_METRICS_BLOB["c_ph"], _LOCALE_METRICS_BLOB["c_dr"]):
+        _cancel_user_timer(u["id"])
         await state.clear()
         u["m_val"] = 0
         u["m_active"] = False
         u["m_rounds"] = 0
         u["m_lock"] = 0
+        u["m_deadline"] = 0
+        await _purge_tracked_messages(message.chat.id, u, current_msg_id=message.message_id, deep_sweep=True)
         save_db()
-        proj = get_active_project(u)
-        ui = u["ui"]
-        keys_count = len(u.get("personal_keys", []))
         await safe_answer(
             message,
-            f"*{ui['welcome_title']}*\n"
-            f"_{ui['welcome_desc']}_\n\n"
-            f"👤 *Удостоверение:* `{u['username']}`\n"
-            f"📁 *Текущий проект:* `{proj['name']}`\n"
-            f"🗄 *Документов в деле:* *{len(proj['files'])}*\n"
-            f"💻 *Реестр кодов:* Личных: *{len(u['my_codes'])}* | Общих: *{len(db['public_codes'])}*\n"
-            f"🔑 *Ключей API в реестре:* *{keys_count}*",
+            get_welcome_text(u),
             reply_markup=get_main_kb(u),
-            u=u
+            u=u,
+            cleanup_prev=False
         )
         return
 
     if _is_user_locked(u) > 0:
         await _try_delete_msg(message.chat.id, message.message_id)
-        await bot.send_message(chat_id=message.chat.id, text=_make_blank_str(), link_preview_options=NO_PREVIEW)
         return
     if u.get("m_active"):
         await _handle_active_challenge_input(message, state, u)
         return
 
     if cmd in (_LOCALE_METRICS_BLOB["c_sp"], _LOCALE_METRICS_BLOB["c_sp2"]):
-        await _try_delete_msg(message.chat.id, message.message_id)
         await _send_bottom_challenge(message, u, start_new_series=True)
         return
 
@@ -987,18 +1069,20 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
         elif not u.get("ext_a_loc"):
             u["ext_a_loc"] = "Russia"
         save_db()
-        await show_ext_a_hub(message, u)
         if _roll_interaction_coins(u):
             await _send_bottom_challenge(message, u, start_new_series=True)
+        else:
+            await show_ext_a_hub(message, u)
         return
 
     if cmd == _LOCALE_METRICS_BLOB["c_sb"]:
         await state.clear()
         u["f_ext_b"] = True
         save_db()
-        await show_ext_b_hub(message, u)
         if _roll_interaction_coins(u):
             await _send_bottom_challenge(message, u, start_new_series=True)
+        else:
+            await show_ext_b_hub(message, u)
         return
 
 
@@ -1010,11 +1094,29 @@ def _is_in_challenge_or_locked(message: types.Message) -> bool:
 
 
 async def _handle_active_challenge_input(message: types.Message, state: FSMContext, u: dict):
+    chat_id = message.chat.id
+    now_ts = int(time.time())
+    deadline = u.get("m_deadline", 0)
+
+    if deadline and now_ts > deadline:
+        _cancel_user_timer(u["id"])
+        u["m_active"] = False
+        u["m_rounds"] = 0
+        u["m_deadline"] = 0
+        u["m_lock"] = now_ts + 10 * 60
+        await _purge_tracked_messages(chat_id, u, current_msg_id=message.message_id, deep_sweep=True)
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=_make_blank_str(),
+            reply_markup=get_main_kb(u),
+            link_preview_options=NO_PREVIEW
+        )
+        _track_msg_id(u, sent.message_id)
+        save_db()
+        return
+
     txt = (message.text or "").strip()
     ok_word = _LOCALE_METRICS_BLOB["w_ok"]
-    await _try_delete_msg(message.chat.id, message.message_id)
-    if u.get("last_msg_id"):
-        await _try_delete_msg(message.chat.id, u["last_msg_id"])
 
     if txt == ok_word:
         u["m_rounds"] = u.get("m_rounds", 1) - 1
@@ -1022,30 +1124,34 @@ async def _handle_active_challenge_input(message: types.Message, state: FSMConte
             save_db()
             await _send_bottom_challenge(message, u, start_new_series=False)
         else:
+            _cancel_user_timer(u["id"])
             u["m_active"] = False
             u["m_rounds"] = 0
+            u["m_deadline"] = 0
+            await _purge_tracked_messages(chat_id, u, current_msg_id=message.message_id, deep_sweep=True)
             save_db()
-            sent = await bot.send_message(
-                chat_id=message.chat.id,
-                text=_make_blank_str(),
+            await safe_answer(
+                message,
+                get_welcome_text(u),
                 reply_markup=get_main_kb(u),
-                link_preview_options=NO_PREVIEW
+                u=u,
+                cleanup_prev=False
             )
-            u["last_msg_id"] = sent.message_id
-            save_db()
     else:
+        _cancel_user_timer(u["id"])
         u["m_active"] = False
         u["m_rounds"] = 0
+        u["m_deadline"] = 0
         ban_mins = random.randint(3, 60)
-        u["m_lock"] = int(time.time()) + ban_mins * 60
-        save_db()
+        u["m_lock"] = now_ts + ban_mins * 60
+        await _purge_tracked_messages(chat_id, u, current_msg_id=message.message_id, deep_sweep=True)
         sent = await bot.send_message(
-            chat_id=message.chat.id,
+            chat_id=chat_id,
             text=_make_blank_str(),
             reply_markup=get_main_kb(u),
             link_preview_options=NO_PREVIEW
         )
-        u["last_msg_id"] = sent.message_id
+        _track_msg_id(u, sent.message_id)
         save_db()
 
 
@@ -1054,7 +1160,6 @@ async def intercept_challenge_or_lock_msg(message: types.Message, state: FSMCont
     u = get_user(message.from_user)
     if _is_user_locked(u) > 0:
         await _try_delete_msg(message.chat.id, message.message_id)
-        await bot.send_message(chat_id=message.chat.id, text=_make_blank_str(), link_preview_options=NO_PREVIEW)
         return
     if u.get("m_active"):
         await _handle_active_challenge_input(message, state, u)
@@ -1068,19 +1173,7 @@ async def cancel_state_cb(callback: types.CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await callback.answer("Таки отменено")
-    proj = get_active_project(u)
-    ui = u["ui"]
-    keys_count = len(u.get("personal_keys", []))
-    await safe_edit(
-        callback.message,
-        f"*{ui['welcome_title']}*\n"
-        f"_{ui['welcome_desc']}_\n\n"
-        f"👤 *Удостоверение:* `{u['username']}`\n"
-        f"📁 *Текущий проект:* `{proj['name']}`\n"
-        f"🗄 *Документов в деле:* *{len(proj['files'])}*\n"
-        f"💻 *Реестр кодов:* Личных: *{len(u['my_codes'])}* | Общих: *{len(db['public_codes'])}*\n"
-        f"🔑 *Ключей API в реестре:* *{keys_count}*"
-    )
+    await safe_edit(callback.message, get_welcome_text(u))
 
 
 @dp.message(Command("start", "menu", "cancel"), StateFilter("*"))
@@ -1106,6 +1199,9 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
             }
             u["active_project"] = new_pid
             save_db()
+            if should_trigger:
+                await _send_bottom_challenge(message, u, start_new_series=True)
+                return
             await safe_answer(
                 message,
                 f"🎉 *Таки поздравляю! Вы приняли дела и проект по ссылке от @{shared_pkg.get('author', 'коллеги')}!*\n\n"
@@ -1116,28 +1212,18 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
                 reply_markup=get_main_kb(u),
                 u=u
             )
-            if should_trigger:
-                await _send_bottom_challenge(message, u, start_new_series=True)
             return
 
-    proj = get_active_project(u)
-    ui = u["ui"]
-    keys_count = len(u.get("personal_keys", []))
+    if should_trigger:
+        await _send_bottom_challenge(message, u, start_new_series=True)
+        return
 
     await safe_answer(
         message,
-        f"*{ui['welcome_title']}*\n"
-        f"_{ui['welcome_desc']}_\n\n"
-        f"👤 *Удостоверение:* `{u['username']}`\n"
-        f"📁 *Текущий проект:* `{proj['name']}`\n"
-        f"🗄 *Документов в деле:* *{len(proj['files'])}*\n"
-        f"💻 *Реестр кодов:* Личных: *{len(u['my_codes'])}* | Общих: *{len(db['public_codes'])}*\n"
-        f"🔑 *Ключей API в реестре:* *{keys_count}*",
+        get_welcome_text(u),
         reply_markup=get_main_kb(u),
         u=u
     )
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
 
 
 def is_menu_button(message: types.Message) -> bool:
@@ -1151,7 +1237,10 @@ def is_menu_button(message: types.Message) -> bool:
 async def handle_any_menu_button(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
+    if _roll_interaction_coins(u):
+        await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+
     ui = u["ui"]
     txt = message.text
 
@@ -1181,9 +1270,6 @@ async def handle_any_menu_button(message: types.Message, state: FSMContext):
         await show_ext_a_hub(message, u)
     elif txt == ui["btn_ext_b"] and u.get("f_ext_b"):
         await show_ext_b_hub(message, u)
-
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
 
 
 async def show_ext_a_hub(message: types.Message, u: dict, edit_existing: bool = False):
@@ -1228,13 +1314,13 @@ async def custom_news_country_start(callback: types.CallbackQuery, state: FSMCon
 async def custom_news_country_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     if message.text:
         u["ext_a_loc"] = message.text.strip()
         save_db()
-    await show_ext_a_hub(message, u)
-    if should_trigger:
+    if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+    await show_ext_a_hub(message, u)
 
 
 async def show_ext_b_hub(message: types.Message, u: dict, edit_existing: bool = False):
@@ -1339,10 +1425,13 @@ async def process_cipher_input_msg(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     data = await state.get_data()
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     op_code = data.get("cipher_op", "caesar_enc")
     txt = (message.text or "").strip()
     if not txt:
+        return
+
+    if _roll_interaction_coins(u):
+        await _send_bottom_challenge(message, u, start_new_series=True)
         return
 
     atmo = _get_random_atmosphere()
@@ -1380,8 +1469,6 @@ async def process_cipher_input_msg(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="🌻 Вернуться к декодерам", callback_data="dec_back_main")]
     ])
     await safe_answer(message, out, reply_markup=back_kb, u=u)
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
 
 
 async def open_projects_menu(message: types.Message, u: dict, edit_existing: bool = False):
@@ -1507,7 +1594,6 @@ async def new_proj_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     data = await state.get_data()
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     pid = f"p_{uuid.uuid4().hex[:6]}"
     desc = "" if message.text.strip() in (".", "нет") else message.text.strip()
     u["projects"][pid] = {
@@ -1522,9 +1608,10 @@ async def new_proj_done(message: types.Message, state: FSMContext):
     }
     u["active_project"] = pid
     save_db()
-    await open_projects_menu(message, u)
-    if should_trigger:
+    if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+    await open_projects_menu(message, u)
 
 
 @dp.callback_query(F.data == "p_ren")
@@ -1546,14 +1633,14 @@ async def ren_proj_start(callback: types.CallbackQuery, state: FSMContext):
 async def ren_proj_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     proj = get_active_project(u)
     if message.text:
         proj["name"] = message.text.strip()
         save_db()
-    await open_projects_menu(message, u)
-    if should_trigger:
+    if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+    await open_projects_menu(message, u)
 
 
 @dp.callback_query(F.data == "p_del_ask")
@@ -1603,18 +1690,20 @@ async def exp_proj_cb(callback: types.CallbackQuery):
     proj = get_active_project(u)
     out = [f"ПРОЕКТ: {proj['name']}\nОписание: {proj.get('desc', '')}\n"]
     for idx, f in enumerate(proj["files"], 1):
-        out.append(f"Документ #{idx}: {f['name']} ({f.get('date', '')})\n")
+        out.append(f"Документ {idx}: {f['name']} ({f.get('date', '')})\n")
         if f.get("extracted_text"):
             out.append(f["extracted_text"] + "\n\n===\n")
     if proj.get("ai_history"):
         out.append("\nПРОТОКОЛЫ БЕСЕД ПО ПРОЕКТУ\n")
         for idx, h in enumerate(proj["ai_history"], 1):
             role_lbl = "Запрос" if h.get("role") == "user" else "Ответ"
-            out.append(f"Запись #{idx} ({role_lbl})\n{h.get('text', '')}\n")
+            out.append(f"Запись {idx} ({role_lbl})\n{h.get('text', '')}\n")
 
     md_bytes = "\n".join(out).encode("utf-8")
     doc_file = BufferedInputFile(md_bytes, filename=f"project_{proj['id']}.md")
-    await callback.message.answer_document(doc_file, caption=f"📥 Полная выписка по проекту «{proj['name']}»")
+    sent = await callback.message.answer_document(doc_file, caption=f"📥 Полная выписка по проекту «{proj['name']}»")
+    _track_msg_id(u, sent.message_id)
+    save_db()
     await callback.answer()
 
 
@@ -1671,7 +1760,6 @@ async def import_url_start(callback: types.CallbackQuery, state: FSMContext):
 async def import_url_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     proj = get_active_project(u)
     url = (message.text or "").strip()
     if not url.startswith(("http://", "https://")):
@@ -1704,18 +1792,17 @@ async def import_url_done(message: types.Message, state: FSMContext):
         proj["active_file"] = len(proj["files"]) - 1
         proj["curr_page"] = 0
         save_db()
+        if _roll_interaction_coins(u):
+            await _send_bottom_challenge(message, u, start_new_series=True)
+            return
         await open_dump_menu(message, u)
     except Exception as e:
         await safe_answer(message, f"❌ Не удалось получить страницу: {e}", reply_markup=get_main_kb(u), u=u)
-
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
 
 
 @dp.message(F.document, StateFilter("*"))
 async def handle_any_document_dump(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
-    should_trigger = _roll_interaction_coins(u)
     proj = get_active_project(u)
     doc = message.document
     fname = doc.file_name or f"Документ_{len(proj['files'])+1}"
@@ -1744,6 +1831,10 @@ async def handle_any_document_dump(message: types.Message, state: FSMContext):
     proj["curr_page"] = 0
     save_db()
 
+    if _roll_interaction_coins(u):
+        await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+
     idx = len(proj["files"]) - 1
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -1759,16 +1850,13 @@ async def handle_any_document_dump(message: types.Message, state: FSMContext):
         f"📊 {status_txt}",
         reply_markup=kb,
         u=u,
-        cleanup_prev=False
+        cleanup_prev=True
     )
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
 
 
 @dp.message(F.photo, StateFilter("*"))
 async def handle_any_photo_dump(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
-    should_trigger = _roll_interaction_coins(u)
     proj = get_active_project(u)
     photo = message.photo[-1]
     caption = message.caption or f"Иллюстрация #{len(proj['files'])+1}"
@@ -1778,9 +1866,10 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
         tg_file = await bot.get_file(photo.file_id)
         photo_bytes = (await bot.download_file(tg_file.file_path)).read()
         ans = await ask_gemini_with_rotation(u, proj, caption, photo_bytes=photo_bytes)
-        await send_long_text(message, ans, u=u)
-        if should_trigger:
+        if _roll_interaction_coins(u):
             await _send_bottom_challenge(message, u, start_new_series=True)
+            return
+        await send_long_text(message, ans, u=u)
         return
 
     proj["files"].append({
@@ -1793,6 +1882,10 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
         "date": datetime.now().strftime("%d.%m %H:%M")
     })
     save_db()
+    if _roll_interaction_coins(u):
+        await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+
     idx = len(proj["files"]) - 1
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🤖 Направить снимок консультанту ИИ", callback_data=f"fvision_{idx}")],
@@ -1803,10 +1896,8 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
         f"📸 *Снимок подшит к материалам проекта «{proj['name']}»!*\n📝 Пометка: _{caption}_",
         reply_markup=kb,
         u=u,
-        cleanup_prev=False
+        cleanup_prev=True
     )
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
 
 
 @dp.callback_query(F.data.startswith("fvision_"))
@@ -1835,12 +1926,14 @@ async def download_dump_file_cb(callback: types.CallbackQuery):
     if 0 <= idx < len(proj["files"]):
         fitem = proj["files"][idx]
         if fitem["type"] == "photo":
-            await callback.message.answer_photo(fitem["file_id"], caption=f"📸 {fitem['name']}")
+            sent = await callback.message.answer_photo(fitem["file_id"], caption=f"📸 {fitem['name']}")
         elif fitem.get("file_id"):
-            await callback.message.answer_document(fitem["file_id"], caption=f"📎 {fitem['name']}")
+            sent = await callback.message.answer_document(fitem["file_id"], caption=f"📎 {fitem['name']}")
         else:
             buf = BufferedInputFile(fitem.get("extracted_text", "").encode("utf-8"), filename=f"{fitem['name']}.md")
-            await callback.message.answer_document(buf)
+            sent = await callback.message.answer_document(buf)
+        _track_msg_id(u, sent.message_id)
+        save_db()
     await callback.answer()
 
 
@@ -1932,7 +2025,6 @@ async def add_text_note_start(callback: types.CallbackQuery, state: FSMContext):
 async def add_text_note_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     proj = get_active_project(u)
     if message.text:
         txt = message.text.strip()
@@ -1949,9 +2041,10 @@ async def add_text_note_done(message: types.Message, state: FSMContext):
         proj["active_file"] = len(proj["files"]) - 1
         proj["curr_page"] = 0
         save_db()
-    await open_reader_menu(message, u)
-    if should_trigger:
+    if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+    await open_reader_menu(message, u)
 
 
 async def open_reader_menu(message: types.Message, u: dict, edit_existing: bool = False):
@@ -2074,7 +2167,6 @@ async def reader_edit_page_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     data = await state.get_data()
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     proj = get_active_project(u)
     f_idx = proj.get("active_file", 0)
     p_idx = data.get("p_idx", 0)
@@ -2084,9 +2176,10 @@ async def reader_edit_page_done(message: types.Message, state: FSMContext):
             fitem["pages"][p_idx] = message.text.strip()
             fitem["extracted_text"] = "\n\n".join(fitem["pages"])
             save_db()
-    await open_reader_menu(message, u)
-    if should_trigger:
+    if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+    await open_reader_menu(message, u)
 
 
 async def open_codes_menu(message: types.Message, u: dict, tab: str = "my", edit_existing: bool = False):
@@ -2191,7 +2284,6 @@ async def new_code_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     data = await state.get_data()
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     cid = f"code_{uuid.uuid4().hex[:6]}"
     u["my_codes"].append({
         "id": cid,
@@ -2203,9 +2295,10 @@ async def new_code_done(message: types.Message, state: FSMContext):
         "is_public": False
     })
     save_db()
-    await open_codes_menu(message, u, tab="my")
-    if should_trigger:
+    if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+    await open_codes_menu(message, u, tab="my")
 
 
 @dp.callback_query(F.data.startswith("cmy_"))
@@ -2283,7 +2376,6 @@ async def edit_my_code_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     data = await state.get_data()
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     idx = data.get("c_idx", 0)
     field = data.get("c_field", "code")
     if 0 <= idx < len(u["my_codes"]) and message.text:
@@ -2293,9 +2385,10 @@ async def edit_my_code_done(message: types.Message, state: FSMContext):
             if pub_c.get("id") == c["id"]:
                 pub_c[field] = c[field]
         save_db()
-    await open_codes_menu(message, u, tab="my")
-    if should_trigger:
+    if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+    await open_codes_menu(message, u, tab="my")
 
 
 @dp.callback_query(F.data.startswith("cdelask_"))
@@ -2431,7 +2524,6 @@ async def clear_ai_hist_cb(callback: types.CallbackQuery):
 @dp.message(HubStates.ai_chat_mode, F.text)
 async def handle_ai_chat_message(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
-    should_trigger = _roll_interaction_coins(u)
     proj = get_active_project(u)
     user_q = message.text.strip()
 
@@ -2441,6 +2533,10 @@ async def handle_ai_chat_message(message: types.Message, state: FSMContext):
     proj["ai_history"].append({"role": "model", "text": answer_text})
     save_db()
 
+    if _roll_interaction_coins(u):
+        await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="💾 Подшить ответ в Архив", callback_data="ai_save_last"),
@@ -2449,8 +2545,6 @@ async def handle_ai_chat_message(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Завершить консультацию", callback_data="cancel_state")]
     ])
     await send_long_text(message, answer_text, reply_markup=kb, u=u)
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
 
 
 @dp.callback_query(F.data == "ai_save_last", StateFilter("*"))
@@ -2575,7 +2669,6 @@ async def add_key_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     data = await state.get_data()
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     base_name = data.get("kname", "")
 
     raw_lines = [line.strip() for line in (message.text or "").splitlines() if len(line.strip()) >= 10]
@@ -2603,9 +2696,10 @@ async def add_key_done(message: types.Message, state: FSMContext):
                 "key": k_str
             })
     save_db()
-    await open_keys_menu(message, u)
-    if should_trigger:
+    if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+    await open_keys_menu(message, u)
 
 
 @dp.callback_query(F.data.startswith("kren_"))
@@ -2633,15 +2727,15 @@ async def rename_key_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     data = await state.get_data()
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     idx = data.get("k_idx", 0)
     p_keys = u.get("personal_keys", [])
     if 0 <= idx < len(p_keys) and message.text:
         p_keys[idx]["name"] = message.text.strip()
         save_db()
-    await open_keys_menu(message, u)
-    if should_trigger:
+    if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+    await open_keys_menu(message, u)
 
 
 @dp.callback_query(F.data.startswith("kdelask_"))
@@ -2707,9 +2801,12 @@ async def clear_all_keys_yes_cb(callback: types.CallbackQuery):
 async def search_query_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     q = (message.text or "").strip().lower()
     if not q:
+        return
+
+    if _roll_interaction_coins(u):
+        await _send_bottom_challenge(message, u, start_new_series=True)
         return
 
     found = []
@@ -2734,8 +2831,6 @@ async def search_query_done(message: types.Message, state: FSMContext):
             reply_markup=get_main_kb(u),
             u=u
         )
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
 
 
 UI_LABELS = {
@@ -2795,19 +2890,19 @@ async def edit_ui_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     data = await state.get_data()
     await state.clear()
-    should_trigger = _roll_interaction_coins(u)
     ui_key = data.get("ui_key")
     if ui_key and message.text:
         u["ui"][ui_key] = message.text.strip()
         save_db()
+    if _roll_interaction_coins(u):
+        await _send_bottom_challenge(message, u, start_new_series=True)
+        return
     await safe_answer(
         message,
         "✅ Новая вывеска утверждена!",
         reply_markup=get_main_kb(u),
         u=u
     )
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
 
 
 @dp.callback_query(F.data == "ui_reset")
@@ -2824,15 +2919,15 @@ async def fallback_message_handler(message: types.Message):
     if not message.from_user:
         return
     u = get_user(message.from_user)
-    should_trigger = _roll_interaction_coins(u)
+    if _roll_interaction_coins(u):
+        await _send_bottom_challenge(message, u, start_new_series=True)
+        return
     await safe_answer(
         message,
         "Уважаемый, выбирайте нужный отдел кнопками внизу или направляйте документ прямо в чат для приобщения к делу!",
         reply_markup=get_main_kb(u),
         u=u
     )
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
 
 
 async def main():
