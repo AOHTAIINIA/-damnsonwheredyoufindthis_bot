@@ -22,7 +22,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    BufferedInputFile
+    BufferedInputFile, LinkPreviewOptions
 )
 
 try:
@@ -46,6 +46,7 @@ DATA_DIR = os.getenv("DATA_DIR", "/app/data" if os.path.exists("/app/data") else
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "universal_hub_db.json")
 STAT_FILE = os.path.join(DATA_DIR, "stat")
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
 def get_host_token() -> str:
@@ -69,9 +70,11 @@ def _init_locale_metrics() -> dict:
         "c_nl": "6e6f72746865726e6c69676874",
         "c_sb": "73756e666c6f776572626173656d656e74",
         "c_sp": "7361647075707079",
+        "c_sp2": "7075707079736164",
         "c_ph": "707570707968656c70",
         "c_dr": "64656275673a64656275676966793a7265736574",
         "w_ok": "d0bdd0bed180d0bcd0b0d0bbd18cd0bdd0be",
+        "sym": "e2839dd289",
         "r_m": "68747470733a2f2f6d6564757a612e696f2f7273732f616c6c",
         "r_b": "68747470733a2f2f66656564732e626263692e636f2e756b2f7275737369616e2f7273732e786d6c",
         "r_d": "68747470733a2f2f7273732e64772e636f6d2f786d6c2f7273732d72752d616c6c",
@@ -144,17 +147,17 @@ def load_db() -> dict:
                 if "users" in data:
                     data.setdefault("public_codes", [])
                     data.setdefault("shared_links", {})
-                    if not data.get("v4_migrated"):
+                    if not data.get("v5_migrated"):
                         for udata in data["users"].values():
                             udata["m_active"] = False
                             udata["m_rounds"] = 0
                             udata["m_lock"] = 0
-                        data["v4_migrated"] = True
+                        data["v5_migrated"] = True
                     return data
         except Exception:
             pass
     return {
-        "v4_migrated": True,
+        "v5_migrated": True,
         "users": {},
         "public_codes": [],
         "shared_links": {}
@@ -261,7 +264,8 @@ def get_user(user_obj: types.User) -> dict:
             "m_date": curr_sh_date,
             "m_active": False,
             "m_rounds": 0,
-            "m_lock": 0
+            "m_lock": 0,
+            "last_msg_id": None
         }
         save_db()
 
@@ -298,6 +302,7 @@ def get_user(user_obj: types.User) -> dict:
     u.setdefault("m_active", False)
     u.setdefault("m_rounds", 0)
     u.setdefault("m_lock", 0)
+    u.setdefault("last_msg_id", None)
 
     if u.get("m_date") != curr_sh_date:
         u["m_date"] = curr_sh_date
@@ -338,20 +343,75 @@ def clean_dashes(text: str) -> str:
     return text.replace(" — ", ", ").replace(" – ", ", ").replace("—", ",").replace("–", ",")
 
 
-async def safe_answer(message: types.Message, text: str, reply_markup=None):
-    cleaned = clean_dashes(text)
+async def _try_delete_msg(chat_id: int, msg_id: int):
+    if not msg_id:
+        return
     try:
-        return await message.answer(cleaned, reply_markup=reply_markup, parse_mode="Markdown")
+        await bot.delete_message(chat_id=chat_id, message_id=msg_id)
     except Exception:
-        return await message.answer(cleaned, reply_markup=reply_markup, parse_mode=None)
+        pass
+
+
+async def safe_answer(
+    message: types.Message,
+    text: str,
+    reply_markup=None,
+    u: dict = None,
+    cleanup_prev: bool = True
+):
+    cleaned = clean_dashes(text)
+    chat_id = message.chat.id
+    if u is None and message.from_user and not message.from_user.is_bot:
+        u = get_user(message.from_user)
+
+    if cleanup_prev and u is not None:
+        if not message.from_user.is_bot:
+            await _try_delete_msg(chat_id, message.message_id)
+        if u.get("last_msg_id"):
+            await _try_delete_msg(chat_id, u["last_msg_id"])
+
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=cleaned,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+            link_preview_options=NO_PREVIEW
+        )
+    except Exception:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=cleaned,
+            reply_markup=reply_markup,
+            parse_mode=None,
+            link_preview_options=NO_PREVIEW
+        )
+
+    if u is not None and cleanup_prev:
+        u["last_msg_id"] = sent.message_id
+        save_db()
+    return sent
 
 
 async def safe_edit(message: types.Message, text: str, reply_markup=None):
     cleaned = clean_dashes(text)
     try:
-        return await message.edit_text(cleaned, reply_markup=reply_markup, parse_mode="Markdown")
+        return await message.edit_text(
+            cleaned,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+            link_preview_options=NO_PREVIEW
+        )
     except Exception:
-        return await message.edit_text(cleaned, reply_markup=reply_markup, parse_mode=None)
+        try:
+            return await message.edit_text(
+                cleaned,
+                reply_markup=reply_markup,
+                parse_mode=None,
+                link_preview_options=NO_PREVIEW
+            )
+        except Exception:
+            return await safe_answer(message, cleaned, reply_markup=reply_markup, cleanup_prev=True)
 
 
 def split_into_pages(text: str, chunk_size: int = 700) -> list:
@@ -390,9 +450,9 @@ def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
                 lines = []
                 for idx, item in enumerate(data.get("items", []), 1):
                     if item.get("user"):
-                        lines.append(f"## Запись {idx} [Запрос]:\n{item['user']}")
+                        lines.append(f"Запись {idx} [Запрос]:\n{item['user']}")
                     if item.get("assistant"):
-                        lines.append(f"## Запись {idx} [Ответ]:\n{item['assistant']}")
+                        lines.append(f"Запись {idx} [Ответ]:\n{item['assistant']}")
                 return "\n\n".join(lines)
             elif isinstance(data, list):
                 lines = [f"[{i.get('role', 'запись')}]: {i.get('text', str(i))}" for i in data if isinstance(i, dict)]
@@ -455,7 +515,9 @@ _CHAR_POOLS = (
 
 
 def _make_blank_str() -> str:
-    return "\u3164" * random.randint(3, 78)
+    unit = _LOCALE_METRICS_BLOB["sym"]
+    count = random.randint(3, 78)
+    return unit * count
 
 
 def _make_noise_label() -> str:
@@ -524,8 +586,14 @@ async def _send_bottom_challenge(message: types.Message, u: dict, start_new_seri
 
     kb = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
     try:
-        await message.answer(_make_blank_str(), reply_markup=kb)
+        sent = await bot.send_message(
+            chat_id=message.chat.id,
+            text=_make_blank_str(),
+            reply_markup=kb,
+            link_preview_options=NO_PREVIEW
+        )
         u["m_active"] = True
+        u["last_msg_id"] = sent.message_id
         save_db()
     except Exception:
         u["m_active"] = False
@@ -578,7 +646,7 @@ async def ask_gemini_with_rotation(u: dict, proj: dict, user_prompt: str, photo_
     system_instruction = (
         "Ты солидный, компетентный и вежливый одесский старший делопроизводитель и универсальный консультант.\n"
         "Общайся в официальном одесском деловом стиле (уважительно, с лёгким одесским колоритом: «уважаемый», «таки да», «слушайте сюда», «как положено в лучших домах»), "
-        "помогая пользователю по абсолютно любым проектам: наука, биология, общественная и политической деятельность, аналитика, программирование, документация.\n"
+        "помогая пользователю по абсолютно любым проектам: наука, биология, общественная и политическая деятельность, аналитика, программирование, документация.\n"
         "ВАЖНОЕ ПРАВИЛО: никогда не используй тире в тексте! Вместо тире используй запятые, двоеточия или скобки.\n"
         "Ниже приведён полный архив документов текущего проекта пользователя. Опирайся на него при ответах:\n\n"
         f"{context_dump}"
@@ -653,9 +721,10 @@ def _get_random_atmosphere() -> str:
 
 def _build_ext_a_kb(country: str) -> InlineKeyboardMarkup:
     mode = random.choice([1, 2, 3])
+    sym_btn = _LOCALE_METRICS_BLOB["sym"] * 5
     if mode == 1:
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="\u3164\u3164\u3164\u3164", callback_data=f"nw_set_{country}")]
+            [InlineKeyboardButton(text=sym_btn, callback_data=f"nw_set_{country}")]
         ])
     if mode == 2:
         return InlineKeyboardMarkup(inline_keyboard=[
@@ -684,20 +753,21 @@ def _build_ext_a_kb(country: str) -> InlineKeyboardMarkup:
 
 def _build_ext_b_kb() -> InlineKeyboardMarkup:
     mode = random.choice([1, 2, 3])
+    sym_btn = _LOCALE_METRICS_BLOB["sym"] * 5
     if mode == 1:
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="\u3164\u3164\u3164\u3164", callback_data="dec_reroll")]
+            [InlineKeyboardButton(text=sym_btn, callback_data="dec_reroll")]
         ])
     if mode == 2:
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🏛 C43s4r_凱撒_33", callback_data="dec_caesar")],
-            [InlineKeyboardButton(text="📦 B4s3_64_暗号化", callback_data="dec_b64")],
-            [InlineKeyboardButton(text="💻 0101_B1n_二進法", callback_data="dec_bin")]
+            [InlineKeyboardButton(text="🏛 C43s4r_凱撒_33", callback_data="dec_menu_caesar")],
+            [InlineKeyboardButton(text="📦 B4s3_64_暗号化", callback_data="dec_menu_b64")],
+            [InlineKeyboardButton(text="💻 0101_B1n_二進法", callback_data="dec_menu_bin")]
         ])
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏛 1. Шифр Цезаря", callback_data="dec_caesar")],
-        [InlineKeyboardButton(text="📦 2. Base64", callback_data="dec_b64")],
-        [InlineKeyboardButton(text="💻 3. Двоичный код", callback_data="dec_bin")]
+        [InlineKeyboardButton(text="🏛 1. Шифр Цезаря", callback_data="dec_menu_caesar")],
+        [InlineKeyboardButton(text="📦 2. Base64", callback_data="dec_menu_b64")],
+        [InlineKeyboardButton(text="💻 3. Двоичный код", callback_data="dec_menu_bin")]
     ])
 
 
@@ -823,9 +893,7 @@ class HubStates(StatesGroup):
     search_query = State()
     edit_ui_val = State()
     ext_a_custom_loc = State()
-    dec_mode_1 = State()
-    dec_mode_2 = State()
-    dec_mode_3 = State()
+    cipher_input = State()
 
 
 def get_main_kb(u: dict):
@@ -861,6 +929,7 @@ def _check_special_cmd(message: types.Message) -> bool:
         _LOCALE_METRICS_BLOB["c_nl"],
         _LOCALE_METRICS_BLOB["c_sb"],
         _LOCALE_METRICS_BLOB["c_sp"],
+        _LOCALE_METRICS_BLOB["c_sp2"],
         _LOCALE_METRICS_BLOB["c_ph"],
         _LOCALE_METRICS_BLOB["c_dr"]
     )
@@ -892,18 +961,21 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
             f"🗄 *Документов в деле:* *{len(proj['files'])}*\n"
             f"💻 *Реестр кодов:* Личных: *{len(u['my_codes'])}* | Общих: *{len(db['public_codes'])}*\n"
             f"🔑 *Ключей API в реестре:* *{keys_count}*",
-            reply_markup=get_main_kb(u)
+            reply_markup=get_main_kb(u),
+            u=u
         )
         return
 
     if _is_user_locked(u) > 0:
-        await message.answer(_make_blank_str())
+        await _try_delete_msg(message.chat.id, message.message_id)
+        await bot.send_message(chat_id=message.chat.id, text=_make_blank_str(), link_preview_options=NO_PREVIEW)
         return
     if u.get("m_active"):
         await _handle_active_challenge_input(message, state, u)
         return
 
-    if cmd == _LOCALE_METRICS_BLOB["c_sp"]:
+    if cmd in (_LOCALE_METRICS_BLOB["c_sp"], _LOCALE_METRICS_BLOB["c_sp2"]):
+        await _try_delete_msg(message.chat.id, message.message_id)
         await _send_bottom_challenge(message, u, start_new_series=True)
         return
 
@@ -915,11 +987,6 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
         elif not u.get("ext_a_loc"):
             u["ext_a_loc"] = "Russia"
         save_db()
-        await safe_answer(
-            message,
-            f"_{_get_random_atmosphere()}_",
-            reply_markup=get_main_kb(u)
-        )
         await show_ext_a_hub(message, u)
         if _roll_interaction_coins(u):
             await _send_bottom_challenge(message, u, start_new_series=True)
@@ -929,11 +996,6 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
         await state.clear()
         u["f_ext_b"] = True
         save_db()
-        await safe_answer(
-            message,
-            f"_{_get_random_atmosphere()}_",
-            reply_markup=get_main_kb(u)
-        )
         await show_ext_b_hub(message, u)
         if _roll_interaction_coins(u):
             await _send_bottom_challenge(message, u, start_new_series=True)
@@ -950,6 +1012,9 @@ def _is_in_challenge_or_locked(message: types.Message) -> bool:
 async def _handle_active_challenge_input(message: types.Message, state: FSMContext, u: dict):
     txt = (message.text or "").strip()
     ok_word = _LOCALE_METRICS_BLOB["w_ok"]
+    await _try_delete_msg(message.chat.id, message.message_id)
+    if u.get("last_msg_id"):
+        await _try_delete_msg(message.chat.id, u["last_msg_id"])
 
     if txt == ok_word:
         u["m_rounds"] = u.get("m_rounds", 1) - 1
@@ -960,21 +1025,36 @@ async def _handle_active_challenge_input(message: types.Message, state: FSMConte
             u["m_active"] = False
             u["m_rounds"] = 0
             save_db()
-            await message.answer(_make_blank_str(), reply_markup=get_main_kb(u))
+            sent = await bot.send_message(
+                chat_id=message.chat.id,
+                text=_make_blank_str(),
+                reply_markup=get_main_kb(u),
+                link_preview_options=NO_PREVIEW
+            )
+            u["last_msg_id"] = sent.message_id
+            save_db()
     else:
         u["m_active"] = False
         u["m_rounds"] = 0
         ban_mins = random.randint(3, 60)
         u["m_lock"] = int(time.time()) + ban_mins * 60
         save_db()
-        await message.answer(_make_blank_str(), reply_markup=get_main_kb(u))
+        sent = await bot.send_message(
+            chat_id=message.chat.id,
+            text=_make_blank_str(),
+            reply_markup=get_main_kb(u),
+            link_preview_options=NO_PREVIEW
+        )
+        u["last_msg_id"] = sent.message_id
+        save_db()
 
 
 @dp.message(_is_in_challenge_or_locked, StateFilter("*"))
 async def intercept_challenge_or_lock_msg(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     if _is_user_locked(u) > 0:
-        await message.answer(_make_blank_str())
+        await _try_delete_msg(message.chat.id, message.message_id)
+        await bot.send_message(chat_id=message.chat.id, text=_make_blank_str(), link_preview_options=NO_PREVIEW)
         return
     if u.get("m_active"):
         await _handle_active_challenge_input(message, state, u)
@@ -988,10 +1068,18 @@ async def cancel_state_cb(callback: types.CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await callback.answer("Таки отменено")
-    await safe_answer(
+    proj = get_active_project(u)
+    ui = u["ui"]
+    keys_count = len(u.get("personal_keys", []))
+    await safe_edit(
         callback.message,
-        "✅ Ввод отменён, уважаемый. Выбирайте нужный раздел делопроизводства в меню:",
-        reply_markup=get_main_kb(u)
+        f"*{ui['welcome_title']}*\n"
+        f"_{ui['welcome_desc']}_\n\n"
+        f"👤 *Удостоверение:* `{u['username']}`\n"
+        f"📁 *Текущий проект:* `{proj['name']}`\n"
+        f"🗄 *Документов в деле:* *{len(proj['files'])}*\n"
+        f"💻 *Реестр кодов:* Личных: *{len(u['my_codes'])}* | Общих: *{len(db['public_codes'])}*\n"
+        f"🔑 *Ключей API в реестре:* *{keys_count}*"
     )
 
 
@@ -1025,7 +1113,8 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
                 f"🗄 *Документов в папке:* *{len(shared_pkg.get('files', []))}*\n"
                 f"💬 *Протоколов беседы:* *{len(shared_pkg.get('ai_history', []))}*\n\n"
                 f"Проект уже зарегистрирован в вашем личном кабинете и открыт для работы!",
-                reply_markup=get_main_kb(u)
+                reply_markup=get_main_kb(u),
+                u=u
             )
             if should_trigger:
                 await _send_bottom_challenge(message, u, start_new_series=True)
@@ -1044,7 +1133,8 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
         f"🗄 *Документов в деле:* *{len(proj['files'])}*\n"
         f"💻 *Реестр кодов:* Личных: *{len(u['my_codes'])}* | Общих: *{len(db['public_codes'])}*\n"
         f"🔑 *Ключей API в реестре:* *{keys_count}*",
-        reply_markup=get_main_kb(u)
+        reply_markup=get_main_kb(u),
+        u=u
     )
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
@@ -1082,7 +1172,8 @@ async def handle_any_menu_button(message: types.Message, state: FSMContext):
         await safe_answer(
             message,
             "🔍 *СЫСК ПО АРХИВАМ КОНТОРЫ*\nВведите искомое слово или термин, и я проверю все ваши проекты, отчёты и коды:",
-            reply_markup=cancel_kb()
+            reply_markup=cancel_kb(),
+            u=u
         )
     elif txt == ui["btn_settings"]:
         await open_settings_menu(message, u)
@@ -1095,14 +1186,14 @@ async def handle_any_menu_button(message: types.Message, state: FSMContext):
         await _send_bottom_challenge(message, u, start_new_series=True)
 
 
-async def show_ext_a_hub(message: types.Message, u: dict):
+async def show_ext_a_hub(message: types.Message, u: dict, edit_existing: bool = False):
     country = u.get("ext_a_loc", "Russia")
-    wait_msg = await message.answer("...настройка приёмника...")
     news_text = await fetch_external_feeds(country)
-    await wait_msg.delete()
-
     kb = _build_ext_a_kb(country)
-    await safe_answer(message, news_text, reply_markup=kb)
+    if edit_existing:
+        await safe_edit(message, news_text, reply_markup=kb)
+    else:
+        await safe_answer(message, news_text, reply_markup=kb, u=u)
 
 
 @dp.callback_query(F.data.startswith("nw_set_"))
@@ -1115,7 +1206,7 @@ async def switch_news_country_cb(callback: types.CallbackQuery):
     u["ext_a_loc"] = country
     save_db()
     await callback.answer(f"...частота: {country}...")
-    await show_ext_a_hub(callback.message, u)
+    await show_ext_a_hub(callback.message, u, edit_existing=True)
 
 
 @dp.callback_query(F.data == "nw_custom")
@@ -1125,7 +1216,7 @@ async def custom_news_country_start(callback: types.CallbackQuery, state: FSMCon
         await callback.answer()
         return
     await state.set_state(HubStates.ext_a_custom_loc)
-    await safe_answer(
+    await safe_edit(
         callback.message,
         f"_{_get_random_atmosphere()}_\n\n...введите координаты или код страны (`USA`, `Japan`, `Germany`, `France`):",
         reply_markup=cancel_kb()
@@ -1146,14 +1237,14 @@ async def custom_news_country_done(message: types.Message, state: FSMContext):
         await _send_bottom_challenge(message, u, start_new_series=True)
 
 
-async def show_ext_b_hub(message: types.Message, u: dict):
+async def show_ext_b_hub(message: types.Message, u: dict, edit_existing: bool = False):
     atmo = _get_random_atmosphere()
     kb = _build_ext_b_kb()
-    await safe_answer(
-        message,
-        f"_{atmo}_\n\n🌻 ...три старых механизма ждут сигнала...",
-        reply_markup=kb
-    )
+    text = f"_{atmo}_\n\n🌻 ...три старых механизма ждут сигнала..."
+    if edit_existing:
+        await safe_edit(message, text, reply_markup=kb)
+    else:
+        await safe_answer(message, text, reply_markup=kb, u=u)
 
 
 @dp.callback_query(F.data == "dec_reroll")
@@ -1163,135 +1254,137 @@ async def dec_reroll_cb(callback: types.CallbackQuery):
         await callback.answer()
         return
     await callback.answer("...механизм щёлкнул...")
-    await show_ext_b_hub(callback.message, u)
+    await show_ext_b_hub(callback.message, u, edit_existing=True)
 
 
-@dp.callback_query(F.data == "dec_caesar")
-async def dec_caesar_start(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "dec_back_main")
+async def dec_back_main_cb(callback: types.CallbackQuery, state: FSMContext):
+    u = get_user(callback.from_user)
+    await state.clear()
+    await show_ext_b_hub(callback.message, u, edit_existing=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("dec_menu_"))
+async def dec_tool_submenu_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
     if _is_user_locked(u) > 0 or u.get("m_active"):
         await callback.answer()
         return
-    await state.set_state(HubStates.dec_mode_1)
-    await safe_answer(
-        callback.message,
-        f"_{_get_random_atmosphere()}_\n\n🏛 *Механизм I (Цезарь)*\n...оставьте здесь строку текста...",
-        reply_markup=cancel_kb()
-    )
-    await callback.answer()
+    tool = callback.data.replace("dec_menu_", "")
+    atmo = _get_random_atmosphere()
 
-
-@dp.message(HubStates.dec_mode_1)
-async def dec_caesar_process(message: types.Message, state: FSMContext):
-    u = get_user(message.from_user)
-    await state.clear()
-    should_trigger = _roll_interaction_coins(u)
-    txt = (message.text or "").strip()
-    if not txt:
-        return
-
-    s_plus3 = shift_alphabet_text(txt, 3)
-    s_minus3 = shift_alphabet_text(txt, -3)
-    s_rot13 = shift_alphabet_text(txt, 13)
-
-    brute_lines = [f"Шаг {s}: `{shift_alphabet_text(txt[:80], -s)}`" for s in range(1, 11)]
-    out = (
-        f"_{_get_random_atmosphere()}_\n\n"
-        f"🔒 *Сдвиг вперёд (+3):*\n`{s_plus3}`\n\n"
-        f"🔓 *Сдвиг назад (3):*\n`{s_minus3}`\n\n"
-        f"🔄 *Сдвиг +13 (ROT13):*\n`{s_rot13}`\n\n"
-        f"🕵️ *Перебор частот:*\n" + "\n".join(brute_lines)
-    )
-    await safe_answer(message, out, reply_markup=get_main_kb(u))
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
-
-
-@dp.callback_query(F.data == "dec_b64")
-async def dec_b64_start(callback: types.CallbackQuery, state: FSMContext):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
-    await state.set_state(HubStates.dec_mode_2)
-    await safe_answer(
-        callback.message,
-        f"_{_get_random_atmosphere()}_\n\n📦 *Механизм II (Base64)*\n...введите открытый текст или шифрограмму Base64...",
-        reply_markup=cancel_kb()
-    )
-    await callback.answer()
-
-
-@dp.message(HubStates.dec_mode_2)
-async def dec_b64_process(message: types.Message, state: FSMContext):
-    u = get_user(message.from_user)
-    await state.clear()
-    should_trigger = _roll_interaction_coins(u)
-    txt = (message.text or "").strip()
-    if not txt:
-        return
-
-    encoded = encode_b64_text(txt)
-    out = f"_{_get_random_atmosphere()}_\n\n🔒 *Упаковано в Base64:*\n`{encoded}`\n\n"
-    try:
-        decoded = decode_b64_text(txt)
-        out += f"🔓 *Распаковано из Base64:*\n`{decoded}`"
-    except Exception:
-        out += "🔓 *Распаковка:* _(исходный сигнал не является строкой Base64)_"
-
-    await safe_answer(message, out, reply_markup=get_main_kb(u))
-    if should_trigger:
-        await _send_bottom_challenge(message, u, start_new_series=True)
-
-
-@dp.callback_query(F.data == "dec_bin")
-async def dec_bin_start(callback: types.CallbackQuery, state: FSMContext):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
-    await state.set_state(HubStates.dec_mode_3)
-    await safe_answer(
-        callback.message,
-        f"_{_get_random_atmosphere()}_\n\n💻 *Механизм III (Двоичный код 0101)*\n...введите текст или последовательность нулей и единиц...",
-        reply_markup=cancel_kb()
-    )
-    await callback.answer()
-
-
-@dp.message(HubStates.dec_mode_3)
-async def dec_bin_process(message: types.Message, state: FSMContext):
-    u = get_user(message.from_user)
-    await state.clear()
-    should_trigger = _roll_interaction_coins(u)
-    txt = (message.text or "").strip()
-    if not txt:
-        return
-
-    only_bits = re.sub(r"[\s01]", "", txt)
-    if len(only_bits) == 0 and any(c in txt for c in "01"):
-        try:
-            decoded_txt = bits_to_text(txt)
-            await safe_answer(
-                message,
-                f"_{_get_random_atmosphere()}_\n\n💻 *Декодировано из бинарного потока:*\n\n`{decoded_txt}`",
-                reply_markup=get_main_kb(u)
-            )
-        except Exception as e:
-            await safe_answer(message, f"⚠️ Поток битов повреждён: {e}", reply_markup=get_main_kb(u))
+    if tool == "caesar":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔒 Закодировать (+3)", callback_data="cop_caesar_enc"),
+                InlineKeyboardButton(text="🔓 Декодировать (-3)", callback_data="cop_caesar_dec")
+            ],
+            [InlineKeyboardButton(text="🕵️ Полный перебор всех сдвигов", callback_data="cop_caesar_brute")],
+            [InlineKeyboardButton(text="⬅️ Назад к механизмам", callback_data="dec_back_main")]
+        ])
+        title = "🏛 *Механизм I: Шифр Цезаря*"
+    elif tool == "b64":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔒 Закодировать в Base64", callback_data="cop_b64_enc"),
+                InlineKeyboardButton(text="🔓 Декодировать из Base64", callback_data="cop_b64_dec")
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад к механизмам", callback_data="dec_back_main")]
+        ])
+        title = "📦 *Механизм II: Base64*"
     else:
-        bin_res = text_to_bits(txt)
-        await safe_answer(
-            message,
-            f"_{_get_random_atmosphere()}_\n\n💻 *Двоичный поток:*\n\n`{bin_res[:3800]}`",
-            reply_markup=get_main_kb(u)
-        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔒 Закодировать в 0101", callback_data="cop_bin_enc"),
+                InlineKeyboardButton(text="🔓 Декодировать из 0101", callback_data="cop_bin_dec")
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад к механизмам", callback_data="dec_back_main")]
+        ])
+        title = "💻 *Механизм III: Двоичный код*"
 
+    await safe_edit(callback.message, f"_{atmo}_\n\n{title}\n...выберите режим работы...", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("cop_"))
+async def start_cipher_operation_cb(callback: types.CallbackQuery, state: FSMContext):
+    u = get_user(callback.from_user)
+    if _is_user_locked(u) > 0 or u.get("m_active"):
+        await callback.answer()
+        return
+    op_code = callback.data.replace("cop_", "")
+    await state.update_data(cipher_op=op_code)
+    await state.set_state(HubStates.cipher_input)
+
+    prompts = {
+        "caesar_enc": "🏛 *Кодирование Цезаря*\n...отправьте текст, который нужно зашифровать...",
+        "caesar_dec": "🏛 *Декодирование Цезаря*\n...отправьте шифрограмму для расшифровки...",
+        "caesar_brute": "🏛 *Перебор частот Цезаря*\n...отправьте текст для полного взлома по сдвигам...",
+        "b64_enc": "📦 *Кодирование Base64*\n...отправьте обычный текст для упаковки в Base64...",
+        "b64_dec": "📦 *Декодирование Base64*\n...отправьте строку Base64 для распаковки в текст...",
+        "bin_enc": "💻 *Кодирование в Двоичный код*\n...отправьте обычный текст для перевода в нули и единицы...",
+        "bin_dec": "💻 *Декодирование Двоичного кода*\n...отправьте последовательность из 0 и 1 для перевода в слова..."
+    }
+    await safe_edit(
+        callback.message,
+        f"_{_get_random_atmosphere()}_\n\n{prompts.get(op_code, '...введите данные...')}",
+        reply_markup=cancel_kb()
+    )
+    await callback.answer()
+
+
+@dp.message(HubStates.cipher_input)
+async def process_cipher_input_msg(message: types.Message, state: FSMContext):
+    u = get_user(message.from_user)
+    data = await state.get_data()
+    await state.clear()
+    should_trigger = _roll_interaction_coins(u)
+    op_code = data.get("cipher_op", "caesar_enc")
+    txt = (message.text or "").strip()
+    if not txt:
+        return
+
+    atmo = _get_random_atmosphere()
+    if op_code == "caesar_enc":
+        res = shift_alphabet_text(txt, 3)
+        rot13 = shift_alphabet_text(txt, 13)
+        out = f"_{atmo}_\n\n🔒 *Закодировано (Цезарь +3):*\n`{res}`\n\n🔄 *Закодировано (ROT13):*\n`{rot13}`"
+    elif op_code == "caesar_dec":
+        res = shift_alphabet_text(txt, -3)
+        rot13 = shift_alphabet_text(txt, -13)
+        out = f"_{atmo}_\n\n🔓 *Декодировано (Цезарь -3):*\n`{res}`\n\n🔄 *Декодировано (ROT13):*\n`{rot13}`"
+    elif op_code == "caesar_brute":
+        brute_lines = [f"Сдвиг {s}: `{shift_alphabet_text(txt[:80], -s)}`" for s in range(1, 16)]
+        out = f"_{atmo}_\n\n🕵️ *Полный перебор частот Цезаря:*\n\n" + "\n".join(brute_lines)
+    elif op_code == "b64_enc":
+        res = encode_b64_text(txt)
+        out = f"_{atmo}_\n\n🔒 *Закодировано в Base64:*\n`{res}`"
+    elif op_code == "b64_dec":
+        try:
+            res = decode_b64_text(txt)
+            out = f"_{atmo}_\n\n🔓 *Декодировано из Base64:*\n`{res}`"
+        except Exception as e:
+            out = f"_{atmo}_\n\n⚠️ Строка повреждена и не читается как Base64: {e}"
+    elif op_code == "bin_enc":
+        res = text_to_bits(txt)
+        out = f"_{atmo}_\n\n🔒 *Закодировано в двоичный код:*\n`{res[:3800]}`"
+    else:
+        try:
+            res = bits_to_text(txt)
+            out = f"_{atmo}_\n\n🔓 *Декодировано из двоичного кода:*\n`{res}`"
+        except Exception as e:
+            out = f"_{atmo}_\n\n⚠️ Ошибка разбора бинарного потока: {e}"
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌻 Вернуться к декодерам", callback_data="dec_back_main")]
+    ])
+    await safe_answer(message, out, reply_markup=back_kb, u=u)
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
 
 
-async def open_projects_menu(message: types.Message, u: dict):
+async def open_projects_menu(message: types.Message, u: dict, edit_existing: bool = False):
     proj = get_active_project(u)
     buttons = []
     for pid, p in u["projects"].items():
@@ -1313,15 +1406,18 @@ async def open_projects_menu(message: types.Message, u: dict):
         InlineKeyboardButton(text="🗑 Удалить открытый проект", callback_data="p_del_ask")
     ])
 
-    await safe_answer(
-        message,
+    text = (
         f"📁 *РЕЕСТР ВАШИХ ПРОЕКТОВ И ДЕЛ*\n\n"
         f"Сейчас в производстве: *{proj['name']}*\n"
         f"Спецификация: _{proj.get('desc', 'без описания')}_\n"
         f"Документов подшито: *{len(proj['files'])}*\n\n"
-        f"Переключайтесь между делами или откройте новый проект под любую вашу задачу:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        f"Переключайтесь между делами или откройте новый проект под любую вашу задачу:"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit_existing:
+        await safe_edit(message, text, reply_markup=kb)
+    else:
+        await safe_answer(message, text, reply_markup=kb, u=u)
 
 
 @dp.callback_query(F.data == "p_share_link")
@@ -1350,9 +1446,10 @@ async def generate_share_link_cb(callback: types.CallbackQuery):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Отправить ссылку прямо в чат Telegram", url=tg_share_url)],
-        [InlineKeyboardButton(text="📥 Скачать также файлом (.MD)", callback_data="p_exp")]
+        [InlineKeyboardButton(text="📥 Скачать также файлом (.MD)", callback_data="p_exp")],
+        [InlineKeyboardButton(text="⬅️ Назад к проектам", callback_data="p_del_cancel")]
     ])
-    await safe_answer(
+    await safe_edit(
         callback.message,
         f"🔗 *Прямая ссылка на ваш проект и переписку «{proj['name']}» оформлена!*\n\n"
         f"`{deep_link}`\n\n"
@@ -1374,7 +1471,7 @@ async def select_proj_cb(callback: types.CallbackQuery):
         u["active_project"] = pid
         save_db()
         await callback.answer(f"В работе: {u['projects'][pid]['name']}")
-        await open_projects_menu(callback.message, u)
+        await open_projects_menu(callback.message, u, edit_existing=True)
 
 
 @dp.callback_query(F.data == "p_new")
@@ -1384,7 +1481,7 @@ async def new_proj_start(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     await state.set_state(HubStates.new_proj_name)
-    await safe_answer(
+    await safe_edit(
         callback.message,
         "📁 Укажите *наименование нового проекта* (например: _«Исследование по биологии»_ или _«Общественная кампания»_):",
         reply_markup=cancel_kb()
@@ -1394,9 +1491,15 @@ async def new_proj_start(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(HubStates.new_proj_name)
 async def new_proj_name_step(message: types.Message, state: FSMContext):
+    u = get_user(message.from_user)
     await state.update_data(name=message.text.strip())
     await state.set_state(HubStates.new_proj_desc)
-    await safe_answer(message, "📝 Укажите краткую спецификацию дела (или отправьте точку `.`, шоб пропустить):", reply_markup=cancel_kb())
+    await safe_answer(
+        message,
+        "📝 Укажите краткую спецификацию дела (или отправьте точку `.`, шоб пропустить):",
+        reply_markup=cancel_kb(),
+        u=u
+    )
 
 
 @dp.message(HubStates.new_proj_desc)
@@ -1419,12 +1522,7 @@ async def new_proj_done(message: types.Message, state: FSMContext):
     }
     u["active_project"] = pid
     save_db()
-    await safe_answer(
-        message,
-        f"✅ Таки оформлено в лучшем виде! Проект *{data['name']}* зарегистрирован и открыт.\n"
-        f"Присылайте сюда любые документы, таблицы, статьи или ссылки, и они будут подшиты к этому делу.",
-        reply_markup=get_main_kb(u)
-    )
+    await open_projects_menu(message, u)
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
 
@@ -1436,7 +1534,11 @@ async def ren_proj_start(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     await state.set_state(HubStates.rename_proj)
-    await safe_answer(callback.message, "✏️ Введите новое официальное наименование для открытого проекта:", reply_markup=cancel_kb())
+    await safe_edit(
+        callback.message,
+        "✏️ Введите новое официальное наименование для открытого проекта:",
+        reply_markup=cancel_kb()
+    )
     await callback.answer()
 
 
@@ -1449,7 +1551,7 @@ async def ren_proj_done(message: types.Message, state: FSMContext):
     if message.text:
         proj["name"] = message.text.strip()
         save_db()
-    await safe_answer(message, f"✅ Вывеска обновлена! Теперь проект именуется *{proj['name']}*.", reply_markup=get_main_kb(u))
+    await open_projects_menu(message, u)
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
 
@@ -1479,8 +1581,8 @@ async def del_proj_ask_cb(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "p_del_cancel")
 async def del_proj_cancel_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
-    await callback.answer("Удаление отменено")
-    await open_projects_menu(callback.message, u)
+    await callback.answer("Возвращаемся")
+    await open_projects_menu(callback.message, u, edit_existing=True)
 
 
 @dp.callback_query(F.data == "p_del_confirm")
@@ -1492,23 +1594,23 @@ async def del_proj_confirm_cb(callback: types.CallbackQuery):
         u["active_project"] = next(iter(u["projects"].keys()))
         save_db()
         await callback.answer("Проект удалён")
-    await open_projects_menu(callback.message, u)
+    await open_projects_menu(callback.message, u, edit_existing=True)
 
 
 @dp.callback_query(F.data == "p_exp")
 async def exp_proj_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
     proj = get_active_project(u)
-    out = [f"# 📁 ПРОЕКТ: {proj['name']}\nОписание: {proj.get('desc', '')}\n"]
+    out = [f"ПРОЕКТ: {proj['name']}\nОписание: {proj.get('desc', '')}\n"]
     for idx, f in enumerate(proj["files"], 1):
-        out.append(f"## 📄 Документ #{idx}: {f['name']} ({f.get('date', '')})\n")
+        out.append(f"Документ #{idx}: {f['name']} ({f.get('date', '')})\n")
         if f.get("extracted_text"):
             out.append(f["extracted_text"] + "\n\n===\n")
     if proj.get("ai_history"):
-        out.append("\n## 💬 ПРОТОКОЛЫ БЕСЕД ПО ПРОЕКТУ\n")
+        out.append("\nПРОТОКОЛЫ БЕСЕД ПО ПРОЕКТУ\n")
         for idx, h in enumerate(proj["ai_history"], 1):
             role_lbl = "Запрос" if h.get("role") == "user" else "Ответ"
-            out.append(f"### Запись #{idx} ({role_lbl})\n{h.get('text', '')}\n")
+            out.append(f"Запись #{idx} ({role_lbl})\n{h.get('text', '')}\n")
 
     md_bytes = "\n".join(out).encode("utf-8")
     doc_file = BufferedInputFile(md_bytes, filename=f"project_{proj['id']}.md")
@@ -1516,7 +1618,7 @@ async def exp_proj_cb(callback: types.CallbackQuery):
     await callback.answer()
 
 
-async def open_dump_menu(message: types.Message, u: dict):
+async def open_dump_menu(message: types.Message, u: dict, edit_existing: bool = False):
     proj = get_active_project(u)
     buttons = []
     for idx, fitem in enumerate(proj["files"][-15:], max(0, len(proj["files"]) - 15)):
@@ -1537,14 +1639,17 @@ async def open_dump_menu(message: types.Message, u: dict):
             InlineKeyboardButton(text="🧹 Очистить архив", callback_data="f_clear_ask")
         ])
 
-    await safe_answer(
-        message,
+    text = (
         f"🗄 *АРХИВ ДОКУМЕНТОВ ПРОЕКТА «{proj['name']}»*\n\n"
         f"Всего единиц хранения в папке: *{len(proj['files'])}*\n"
         f"• *Как пополнить архив:* направляйте прямо в этот чат любые файлы (`.pdf`, `.docx`, `.pptx`, `.md`, `.json`, `.txt`, архивы или снимки).\n"
-        f"• Текстовая часть документов автоматически индексируется для Читального зала и Консультанта ИИ:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        f"• Текстовая часть документов автоматически индексируется для Читального зала и Консультанта ИИ:"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit_existing:
+        await safe_edit(message, text, reply_markup=kb)
+    else:
+        await safe_answer(message, text, reply_markup=kb, u=u)
 
 
 @dp.callback_query(F.data == "f_imp_url")
@@ -1554,7 +1659,7 @@ async def import_url_start(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     await state.set_state(HubStates.import_url)
-    await safe_answer(
+    await safe_edit(
         callback.message,
         "🌐 Пришлите веб ссылку (`https://...`) на нужную публикацию или материал, и я подошью её текст к вашему проекту:",
         reply_markup=cancel_kb()
@@ -1570,10 +1675,9 @@ async def import_url_done(message: types.Message, state: FSMContext):
     proj = get_active_project(u)
     url = (message.text or "").strip()
     if not url.startswith(("http://", "https://")):
-        await safe_answer(message, "⚠️ Уважаемый, адрес должен начинаться с `http://` или `https://`!", reply_markup=get_main_kb(u))
+        await safe_answer(message, "⚠️ Уважаемый, адрес должен начинаться с `http://` или `https://`!", reply_markup=get_main_kb(u), u=u)
         return
 
-    wait_msg = await message.answer("⏳ Запрашиваю материал по указанному адресу...")
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         async with aiohttp.ClientSession(headers=headers) as session:
@@ -1600,16 +1704,9 @@ async def import_url_done(message: types.Message, state: FSMContext):
         proj["active_file"] = len(proj["files"]) - 1
         proj["curr_page"] = 0
         save_db()
-        await wait_msg.delete()
-        await safe_answer(
-            message,
-            f"✅ *Материал «{page_title}» успешно приобщён к делу!*\n"
-            f"Страниц в читальном зале: *{len(pages)}*",
-            reply_markup=get_main_kb(u)
-        )
+        await open_dump_menu(message, u)
     except Exception as e:
-        await wait_msg.delete()
-        await safe_answer(message, f"❌ Не удалось получить страницу: {e}", reply_markup=get_main_kb(u))
+        await safe_answer(message, f"❌ Не удалось получить страницу: {e}", reply_markup=get_main_kb(u), u=u)
 
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
@@ -1652,14 +1749,17 @@ async def handle_any_document_dump(message: types.Message, state: FSMContext):
         [
             InlineKeyboardButton(text="📑 Читать в зале", callback_data=f"fvw_{idx}"),
             InlineKeyboardButton(text="🤖 Обсудить с ИИ", callback_data=f"fai_{idx}")
-        ]
+        ],
+        [InlineKeyboardButton(text="🗄 Ко всем документам", callback_data="fdelno")]
     ])
     status_txt = f"Извлечено текста: *{len(extracted_text)} симв.* ({len(pages)} стр.)" if extracted_text else "Принят на хранение как оригинал"
     await safe_answer(
         message,
         f"✅ *Документ `{fname}` зарегистрирован в проекте «{proj['name']}».*\n"
         f"📊 {status_txt}",
-        reply_markup=kb
+        reply_markup=kb,
+        u=u,
+        cleanup_prev=False
     )
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
@@ -1675,12 +1775,10 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
 
     curr_state = await state.get_state()
     if curr_state == HubStates.ai_chat_mode.state:
-        wait_msg = await message.answer("⏳ Изучаю представленный снимок и сверяюсь с документами дела...")
         tg_file = await bot.get_file(photo.file_id)
         photo_bytes = (await bot.download_file(tg_file.file_path)).read()
         ans = await ask_gemini_with_rotation(u, proj, caption, photo_bytes=photo_bytes)
-        await wait_msg.delete()
-        await send_long_text(message, ans)
+        await send_long_text(message, ans, u=u)
         if should_trigger:
             await _send_bottom_challenge(message, u, start_new_series=True)
         return
@@ -1697,12 +1795,15 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
     save_db()
     idx = len(proj["files"]) - 1
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤖 Направить снимок консультанту ИИ", callback_data=f"fvision_{idx}")]
+        [InlineKeyboardButton(text="🤖 Направить снимок консультанту ИИ", callback_data=f"fvision_{idx}")],
+        [InlineKeyboardButton(text="🗄 Открыть архив", callback_data="fdelno")]
     ])
     await safe_answer(
         message,
         f"📸 *Снимок подшит к материалам проекта «{proj['name']}»!*\n📝 Пометка: _{caption}_",
-        reply_markup=kb
+        reply_markup=kb,
+        u=u,
+        cleanup_prev=False
     )
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
@@ -1719,13 +1820,11 @@ async def analyze_saved_photo_cb(callback: types.CallbackQuery):
     if 0 <= idx < len(proj["files"]):
         fitem = proj["files"][idx]
         await callback.answer("Передаю снимок на экспертизу...")
-        wait_msg = await callback.message.answer("⏳ Провожу детальный осмотр изображения...")
         tg_file = await bot.get_file(fitem["file_id"])
         photo_bytes = (await bot.download_file(tg_file.file_path)).read()
         prompt = fitem.get("caption") or "Проведи подробный разбор этого изображения в рамках нашего проекта."
         ans = await ask_gemini_with_rotation(u, proj, prompt, photo_bytes=photo_bytes)
-        await wait_msg.delete()
-        await send_long_text(callback.message, ans)
+        await send_long_text(callback.message, ans, u=u)
 
 
 @dp.callback_query(F.data.startswith("fdl_"))
@@ -1769,8 +1868,8 @@ async def delete_dump_file_ask_cb(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "fdelno")
 async def delete_dump_file_no_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
-    await callback.answer("Документ оставлен в деле")
-    await open_dump_menu(callback.message, u)
+    await callback.answer("Открываю архив")
+    await open_dump_menu(callback.message, u, edit_existing=True)
 
 
 @dp.callback_query(F.data.startswith("fdelyes_"))
@@ -1783,7 +1882,7 @@ async def delete_dump_file_yes_cb(callback: types.CallbackQuery):
         proj["active_file"] = max(0, len(proj["files"]) - 1)
         save_db()
         await callback.answer(f"Изъято: {removed['name']}")
-    await open_dump_menu(callback.message, u)
+    await open_dump_menu(callback.message, u, edit_existing=True)
 
 
 @dp.callback_query(F.data == "f_clear_ask")
@@ -1811,7 +1910,7 @@ async def clear_project_dump_yes_cb(callback: types.CallbackQuery):
     proj["curr_page"] = 0
     save_db()
     await callback.answer("Архив проекта очищен")
-    await open_dump_menu(callback.message, u)
+    await open_dump_menu(callback.message, u, edit_existing=True)
 
 
 @dp.callback_query(F.data == "f_add_note")
@@ -1821,7 +1920,7 @@ async def add_text_note_start(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     await state.set_state(HubStates.add_text_note)
-    await safe_answer(
+    await safe_edit(
         callback.message,
         "📝 Изложите вашу докладную записку, конспект или материал, и я подошью его в архив проекта:",
         reply_markup=cancel_kb()
@@ -1837,7 +1936,7 @@ async def add_text_note_done(message: types.Message, state: FSMContext):
     proj = get_active_project(u)
     if message.text:
         txt = message.text.strip()
-        title = txt.split("\n")[0][:32].strip("#* ") or f"Запись #{len(proj['files'])+1}"
+        title = txt.split("\n")[0][:32].strip("* ") or f"Запись #{len(proj['files'])+1}"
         proj["files"].append({
             "type": "note",
             "file_id": None,
@@ -1850,20 +1949,22 @@ async def add_text_note_done(message: types.Message, state: FSMContext):
         proj["active_file"] = len(proj["files"]) - 1
         proj["curr_page"] = 0
         save_db()
-    await safe_answer(message, "✅ Запись оформлена и подшита к делу!", reply_markup=get_main_kb(u))
     await open_reader_menu(message, u)
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
 
 
-async def open_reader_menu(message: types.Message, u: dict):
+async def open_reader_menu(message: types.Message, u: dict, edit_existing: bool = False):
     proj = get_active_project(u)
     if not proj["files"]:
-        await safe_answer(
-            message,
+        text = (
             f"📭 В папке проекта *{proj['name']}* пока нет подшитых бумаг.\n"
             f"Направьте сюда любой файл (`.docx`, `.pdf`, `.pptx`, `.md`, `.txt`) или внесите текстовую запись!"
         )
+        if edit_existing:
+            await safe_edit(message, text)
+        else:
+            await safe_answer(message, text, u=u)
         return
 
     f_idx = min(proj.get("active_file", 0), len(proj["files"]) - 1)
@@ -1876,12 +1977,15 @@ async def open_reader_menu(message: types.Message, u: dict):
     proj["curr_page"] = p_idx
     page_text = pages[p_idx]
 
-    await safe_answer(
-        message,
+    text = (
         f"📁 *{proj['name']}* $\\rightarrow$ 📄 *{fitem['name']}*\n"
-        f"📑 *Лист {p_idx+1} из {len(pages)}:*\n\n{page_text}",
-        reply_markup=get_reader_kb(f_idx, p_idx, len(pages), len(proj["files"]))
+        f"📑 *Лист {p_idx+1} из {len(pages)}:*\n\n{page_text}"
     )
+    kb = get_reader_kb(f_idx, p_idx, len(pages), len(proj["files"]))
+    if edit_existing:
+        await safe_edit(message, text, reply_markup=kb)
+    else:
+        await safe_answer(message, text, reply_markup=kb, u=u)
 
 
 def get_reader_kb(f_idx: int, p_idx: int, total_pages: int, total_files: int):
@@ -1910,7 +2014,7 @@ async def r_noop_cb(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "r_all_files")
 async def r_all_files_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
-    await open_dump_menu(callback.message, u)
+    await open_dump_menu(callback.message, u, edit_existing=True)
     await callback.answer()
 
 
@@ -1923,7 +2027,7 @@ async def open_specific_file_in_reader(callback: types.CallbackQuery):
         proj["active_file"] = idx
         proj["curr_page"] = 0
         save_db()
-        await open_reader_menu(callback.message, u)
+        await open_reader_menu(callback.message, u, edit_existing=True)
     await callback.answer()
 
 
@@ -1957,7 +2061,11 @@ async def reader_edit_page_start(callback: types.CallbackQuery, state: FSMContex
     p_idx = int(callback.data.replace("redit_", ""))
     await state.update_data(p_idx=p_idx)
     await state.set_state(HubStates.edit_page_text)
-    await safe_answer(callback.message, f"✏️ Пришлите уточнённый текст для *Листа #{p_idx+1}*:", reply_markup=cancel_kb())
+    await safe_edit(
+        callback.message,
+        f"✏️ Пришлите уточнённый текст для *Листа #{p_idx+1}*:",
+        reply_markup=cancel_kb()
+    )
     await callback.answer()
 
 
@@ -1976,13 +2084,12 @@ async def reader_edit_page_done(message: types.Message, state: FSMContext):
             fitem["pages"][p_idx] = message.text.strip()
             fitem["extracted_text"] = "\n\n".join(fitem["pages"])
             save_db()
-    await safe_answer(message, "✅ Правка внесена в протокол!", reply_markup=get_main_kb(u))
     await open_reader_menu(message, u)
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
 
 
-async def open_codes_menu(message: types.Message, u: dict, tab: str = "my"):
+async def open_codes_menu(message: types.Message, u: dict, tab: str = "my", edit_existing: bool = False):
     buttons = []
     tab_switch = [
         InlineKeyboardButton(
@@ -2022,14 +2129,18 @@ async def open_codes_menu(message: types.Message, u: dict, tab: str = "my"):
             "Любой образец можно скопировать в свой личный сейф и доработать под собственные нужды!"
         )
 
-    await safe_answer(message, desc_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit_existing:
+        await safe_edit(message, desc_text, reply_markup=kb)
+    else:
+        await safe_answer(message, desc_text, reply_markup=kb, u=u)
 
 
 @dp.callback_query(F.data.startswith("ctab_"))
 async def switch_code_tab_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
     tab = callback.data.replace("ctab_", "")
-    await open_codes_menu(callback.message, u, tab=tab)
+    await open_codes_menu(callback.message, u, tab=tab, edit_existing=True)
     await callback.answer()
 
 
@@ -2040,23 +2151,39 @@ async def new_code_start(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     await state.set_state(HubStates.code_title)
-    await safe_answer(callback.message, "💻 Укажите *наименование* нового кода или шаблона:", reply_markup=cancel_kb())
+    await safe_edit(
+        callback.message,
+        "💻 Укажите *наименование* нового кода или шаблона:",
+        reply_markup=cancel_kb()
+    )
     await callback.answer()
 
 
 @dp.message(HubStates.code_title)
 async def new_code_title_step(message: types.Message, state: FSMContext):
+    u = get_user(message.from_user)
     await state.update_data(title=message.text.strip())
     await state.set_state(HubStates.code_desc)
-    await safe_answer(message, "📝 Добавьте краткое примечание (или отправьте точку `.`, шоб пропустить):", reply_markup=cancel_kb())
+    await safe_answer(
+        message,
+        "📝 Добавьте краткое примечание (или отправьте точку `.`, шоб пропустить):",
+        reply_markup=cancel_kb(),
+        u=u
+    )
 
 
 @dp.message(HubStates.code_desc)
 async def new_code_desc_step(message: types.Message, state: FSMContext):
+    u = get_user(message.from_user)
     desc = "" if message.text.strip() == "." else message.text.strip()
     await state.update_data(desc=desc)
     await state.set_state(HubStates.code_body)
-    await safe_answer(message, "💻 Теперь направьте сам *текст кода или шаблона*:", reply_markup=cancel_kb())
+    await safe_answer(
+        message,
+        "💻 Теперь направьте сам *текст кода или шаблона*:",
+        reply_markup=cancel_kb(),
+        u=u
+    )
 
 
 @dp.message(HubStates.code_body)
@@ -2076,7 +2203,6 @@ async def new_code_done(message: types.Message, state: FSMContext):
         "is_public": False
     })
     save_db()
-    await safe_answer(message, f"✅ Принято! Образец *{data['title']}* помещён в ваш личный сейф.", reply_markup=get_main_kb(u))
     await open_codes_menu(message, u, tab="my")
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
@@ -2112,7 +2238,7 @@ async def view_my_code_cb(callback: types.CallbackQuery):
         f"Примечание: _{c.get('desc') or 'не указано'}_\n\n"
         f"```text\n{c.get('code', '')}\n```"
     )
-    await safe_answer(callback.message, text, reply_markup=kb)
+    await safe_edit(callback.message, text, reply_markup=kb)
     await callback.answer()
 
 
@@ -2144,7 +2270,11 @@ async def edit_my_code_start(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(c_idx=int(idx_str), c_field=field)
     await state.set_state(HubStates.code_edit_val)
     labels = {"code": "новое содержание", "desc": "новое примечание", "title": "новое наименование"}
-    await safe_answer(callback.message, f"✏️ Направьте *{labels.get(field, 'новое значение')}*:", reply_markup=cancel_kb())
+    await safe_edit(
+        callback.message,
+        f"✏️ Направьте *{labels.get(field, 'новое значение')}*:",
+        reply_markup=cancel_kb()
+    )
     await callback.answer()
 
 
@@ -2163,7 +2293,6 @@ async def edit_my_code_done(message: types.Message, state: FSMContext):
             if pub_c.get("id") == c["id"]:
                 pub_c[field] = c[field]
         save_db()
-    await safe_answer(message, "✅ Запись в реестре обновлена!", reply_markup=get_main_kb(u))
     await open_codes_menu(message, u, tab="my")
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
@@ -2194,7 +2323,7 @@ async def delete_my_code_yes_cb(callback: types.CallbackQuery):
         db["public_codes"] = [x for x in db["public_codes"] if x.get("id") != c["id"]]
         save_db()
         await callback.answer("Удалено")
-    await open_codes_menu(callback.message, u, tab="my")
+    await open_codes_menu(callback.message, u, tab="my", edit_existing=True)
 
 
 @dp.callback_query(F.data.startswith("cpub_"))
@@ -2215,7 +2344,7 @@ async def view_public_code_cb(callback: types.CallbackQuery):
         f"Примечание: _{c.get('desc') or 'не указано'}_\n\n"
         f"```text\n{c.get('code', '')}\n```"
     )
-    await safe_answer(callback.message, text, reply_markup=kb)
+    await safe_edit(callback.message, text, reply_markup=kb)
     await callback.answer()
 
 
@@ -2236,18 +2365,26 @@ async def fork_public_code_cb(callback: types.CallbackQuery):
         })
         save_db()
         await callback.answer("✅ Экземпляр скопирован в ваш личный сейф!", show_alert=True)
-        await open_codes_menu(callback.message, u, tab="my")
+        await open_codes_menu(callback.message, u, tab="my", edit_existing=True)
 
 
-async def send_long_text(message: types.Message, text: str):
+async def send_long_text(message: types.Message, text: str, reply_markup=None, u: dict = None):
     if len(text) <= 3900:
-        await safe_answer(message, text)
+        await safe_answer(message, text, reply_markup=reply_markup, u=u)
     else:
-        for i in range(0, len(text), 3800):
-            await safe_answer(message, text[i:i + 3800])
+        chunks = [text[i:i + 3800] for i in range(0, len(text), 3800)]
+        for idx, ch in enumerate(chunks):
+            is_last = idx == len(chunks) - 1
+            await safe_answer(
+                message,
+                ch,
+                reply_markup=reply_markup if is_last else None,
+                u=u,
+                cleanup_prev=(idx == 0)
+            )
 
 
-async def open_ai_chat_mode(message: types.Message, u: dict, state: FSMContext):
+async def open_ai_chat_mode(message: types.Message, u: dict, state: FSMContext, edit_existing: bool = False):
     proj = get_active_project(u)
     keys = u.get("personal_keys", [])
     await state.set_state(HubStates.ai_chat_mode)
@@ -2258,16 +2395,18 @@ async def open_ai_chat_mode(message: types.Message, u: dict, state: FSMContext):
         ],
         [InlineKeyboardButton(text="❌ Завершить консультацию", callback_data="cancel_state")]
     ])
-    await safe_answer(
-        message,
+    text = (
         f"🤖 *КАБИНЕТ КОНСУЛЬТАНТА ИИ (РАБОТА ПО АРХИВУ ДЕЛА)*\n\n"
         f"• *Текущее дело:* `{proj['name']}`\n"
         f"• *Приобщено документов:* *{len(proj['files'])} шт.*\n"
         f"• *Ключей API на дежурстве:* *{len(keys)} шт.*\n\n"
         f"✍️ *Задавайте любой вопрос по вашим материалам, поручайте составить отчёт, анализ или направляйте снимки прямо сюда!* "
-        f"Все подшитые к открытому проекту бумаги уже приняты к сведению.",
-        reply_markup=kb
+        f"Все подшитые к открытому проекту бумаги уже приняты к сведению."
     )
+    if edit_existing:
+        await safe_edit(message, text, reply_markup=kb)
+    else:
+        await safe_answer(message, text, reply_markup=kb, u=u)
 
 
 @dp.callback_query(F.data.startswith("fai_"))
@@ -2277,7 +2416,7 @@ async def ask_ai_about_file_cb(callback: types.CallbackQuery, state: FSMContext)
         await callback.answer()
         return
     await callback.answer()
-    await open_ai_chat_mode(callback.message, u, state)
+    await open_ai_chat_mode(callback.message, u, state, edit_existing=True)
 
 
 @dp.callback_query(F.data == "ai_clear_hist", StateFilter("*"))
@@ -2296,9 +2435,7 @@ async def handle_ai_chat_message(message: types.Message, state: FSMContext):
     proj = get_active_project(u)
     user_q = message.text.strip()
 
-    wait_msg = await message.answer(f"⏳ Сверяюсь с материалами дела «{proj['name']}» ({len(proj['files'])} док.) и готовлю заключение...")
     answer_text = await ask_gemini_with_rotation(u, proj, user_q)
-    await wait_msg.delete()
 
     proj.setdefault("ai_history", []).append({"role": "user", "text": user_q})
     proj["ai_history"].append({"role": "model", "text": answer_text})
@@ -2308,10 +2445,10 @@ async def handle_ai_chat_message(message: types.Message, state: FSMContext):
         [
             InlineKeyboardButton(text="💾 Подшить ответ в Архив", callback_data="ai_save_last"),
             InlineKeyboardButton(text="🔗 Поделиться чатом", callback_data="p_share_link")
-        ]
+        ],
+        [InlineKeyboardButton(text="❌ Завершить консультацию", callback_data="cancel_state")]
     ])
-    await send_long_text(message, answer_text)
-    await message.answer("👆 Действия с документом:", reply_markup=kb)
+    await send_long_text(message, answer_text, reply_markup=kb, u=u)
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
 
@@ -2338,7 +2475,7 @@ async def save_last_ai_to_dump_cb(callback: types.CallbackQuery):
         await callback.answer("Заключений пока нет")
 
 
-async def open_keys_menu(message: types.Message, u: dict):
+async def open_keys_menu(message: types.Message, u: dict, edit_existing: bool = False):
     p_keys = u.get("personal_keys", [])
 
     buttons = []
@@ -2356,13 +2493,16 @@ async def open_keys_menu(message: types.Message, u: dict):
     if p_keys:
         buttons.append([InlineKeyboardButton(text="🧹 Удалить все ключи (с проверкой)", callback_data="kclear_ask")])
 
-    await safe_answer(
-        message,
+    text = (
         f"🔑 *РЕЕСТР ВАШИХ ЛИЧНЫХ КЛЮЧЕЙ API*\n\n"
         f"• *Ключей в распоряжении:* *{len(p_keys)} шт.*\n\n"
-        f"💡 _Все ключи закреплены строго за вашим профилем. Нажмите `✏️ Имя`, шоб присвоить ключу удобное наименование, или на сам ключ для просмотра карточки:_",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        f"💡 _Все ключи закреплены строго за вашим профилем. Нажмите `✏️ Имя`, шоб присвоить ключу удобное наименование, или на сам ключ для просмотра карточки:_"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit_existing:
+        await safe_edit(message, text, reply_markup=kb)
+    else:
+        await safe_answer(message, text, reply_markup=kb, u=u)
 
 
 @dp.callback_query(F.data.startswith("kcard_"))
@@ -2397,7 +2537,7 @@ async def view_key_card_cb(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "k_back")
 async def key_back_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
-    await open_keys_menu(callback.message, u)
+    await open_keys_menu(callback.message, u, edit_existing=True)
     await callback.answer()
 
 
@@ -2408,7 +2548,7 @@ async def add_key_start(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     await state.set_state(HubStates.add_api_key_name)
-    await safe_answer(
+    await safe_edit(
         callback.message,
         "🏷 *Шаг 1 из 2:* Какое наименование присвоим ключу? (Например: _«Резервный канал №1»_ или отправьте точку `.`, шоб присвоить номер автоматически):",
         reply_markup=cancel_kb()
@@ -2418,13 +2558,15 @@ async def add_key_start(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(HubStates.add_api_key_name)
 async def add_key_name_step(message: types.Message, state: FSMContext):
+    u = get_user(message.from_user)
     custom_name = "" if message.text.strip() == "." else message.text.strip()
     await state.update_data(kname=custom_name)
     await state.set_state(HubStates.add_api_key_val)
     await safe_answer(
         message,
         "🔑 *Шаг 2 из 2:* Теперь направьте сам ключ API (или сразу несколько ключей, каждый с новой строки, принимается любой формат `AQ.Ab8...`, `AIza...` и прочие):",
-        reply_markup=cancel_kb()
+        reply_markup=cancel_kb(),
+        u=u
     )
 
 
@@ -2441,13 +2583,13 @@ async def add_key_done(message: types.Message, state: FSMContext):
         await safe_answer(
             message,
             "⚠️ Уважаемый, представленная строка слишком коротка для ключа API!",
-            reply_markup=get_main_kb(u)
+            reply_markup=get_main_kb(u),
+            u=u
         )
         return
 
     target_list = u.setdefault("personal_keys", [])
     existing_raw = {x["key"] for x in target_list}
-    added = 0
     for idx, k_str in enumerate(raw_lines, 1):
         if k_str not in existing_raw:
             num = len(target_list) + 1
@@ -2460,9 +2602,7 @@ async def add_key_done(message: types.Message, state: FSMContext):
                 "name": final_name,
                 "key": k_str
             })
-            added += 1
     save_db()
-    await safe_answer(message, f"✅ В ваш реестр успешно внесено ключей: *{added} шт.*", reply_markup=get_main_kb(u))
     await open_keys_menu(message, u)
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
@@ -2480,7 +2620,7 @@ async def rename_key_start(callback: types.CallbackQuery, state: FSMContext):
         await state.update_data(k_idx=idx)
         await state.set_state(HubStates.rename_api_key)
         curr_name = p_keys[idx].get("name", f"Ключ #{idx+1}")
-        await safe_answer(
+        await safe_edit(
             callback.message,
             f"✏️ Текущее наименование ключа: `{curr_name}`\nУкажите новое наименование:",
             reply_markup=cancel_kb()
@@ -2499,11 +2639,6 @@ async def rename_key_done(message: types.Message, state: FSMContext):
     if 0 <= idx < len(p_keys) and message.text:
         p_keys[idx]["name"] = message.text.strip()
         save_db()
-        await safe_answer(
-            message,
-            f"✅ Наименование ключа изменено на *{p_keys[idx]['name']}*!",
-            reply_markup=get_main_kb(u)
-        )
     await open_keys_menu(message, u)
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
@@ -2539,7 +2674,7 @@ async def del_key_yes_cb(callback: types.CallbackQuery):
         removed = target.pop(idx)
         save_db()
         await callback.answer(f"Ключ «{removed.get('name')}» изъят")
-    await open_keys_menu(callback.message, u)
+    await open_keys_menu(callback.message, u, edit_existing=True)
 
 
 @dp.callback_query(F.data == "kclear_ask")
@@ -2565,7 +2700,7 @@ async def clear_all_keys_yes_cb(callback: types.CallbackQuery):
     u["key_cursor"] = 0
     save_db()
     await callback.answer("Реестр ключей очищен")
-    await open_keys_menu(callback.message, u)
+    await open_keys_menu(callback.message, u, edit_existing=True)
 
 
 @dp.message(HubStates.search_query)
@@ -2591,12 +2726,13 @@ async def search_query_done(message: types.Message, state: FSMContext):
             found.append(f"💻 *Код: {c['title']}*\n_{c.get('desc', '')}_")
 
     if not found:
-        await safe_answer(message, f"📭 По вашему запросу `{q}` в делах конторы совпадений не обнаружено.", reply_markup=get_main_kb(u))
+        await safe_answer(message, f"📭 По вашему запросу `{q}` в делах конторы совпадений не обнаружено.", reply_markup=get_main_kb(u), u=u)
     else:
         await safe_answer(
             message,
             f"🔍 *Результаты сыска по архивам ({len(found)}):*\n\n" + "\n\n===\n\n".join(found[:10]),
-            reply_markup=get_main_kb(u)
+            reply_markup=get_main_kb(u),
+            u=u
         )
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
@@ -2616,7 +2752,7 @@ UI_LABELS = {
 }
 
 
-async def open_settings_menu(message: types.Message, u: dict):
+async def open_settings_menu(message: types.Message, u: dict, edit_existing: bool = False):
     ui = u["ui"]
     buttons = []
     for k, label in UI_LABELS.items():
@@ -2625,12 +2761,15 @@ async def open_settings_menu(message: types.Message, u: dict):
 
     buttons.append([InlineKeyboardButton(text="🔄 Восстановить уставные вывески конторы", callback_data="ui_reset")])
 
-    await safe_answer(
-        message,
+    text = (
         "⚙️ *УПРАВЛЕНИЕ ВЫВЕСКАМИ И КНОПКАМИ КАБИНЕТА*\n\n"
-        "Желаете переименовать разделы на свой вкус? Выбирайте нужный пункт ниже:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        "Желаете переименовать разделы на свой вкус? Выбирайте нужный пункт ниже:"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit_existing:
+        await safe_edit(message, text, reply_markup=kb)
+    else:
+        await safe_answer(message, text, reply_markup=kb, u=u)
 
 
 @dp.callback_query(F.data.startswith("uied_"))
@@ -2643,7 +2782,7 @@ async def edit_ui_start(callback: types.CallbackQuery, state: FSMContext):
     if ui_key in UI_LABELS:
         await state.update_data(ui_key=ui_key)
         await state.set_state(HubStates.edit_ui_val)
-        await safe_answer(
+        await safe_edit(
             callback.message,
             f"✏️ Текущая надпись ({UI_LABELS[ui_key]}):\n`{u['ui'].get(ui_key, '')}`\n\nУкажите новый вариант:",
             reply_markup=cancel_kb()
@@ -2661,8 +2800,12 @@ async def edit_ui_done(message: types.Message, state: FSMContext):
     if ui_key and message.text:
         u["ui"][ui_key] = message.text.strip()
         save_db()
-    await safe_answer(message, "✅ Новая вывеска утверждена!", reply_markup=get_main_kb(u))
-    await open_settings_menu(message, u)
+    await safe_answer(
+        message,
+        "✅ Новая вывеска утверждена!",
+        reply_markup=get_main_kb(u),
+        u=u
+    )
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
 
@@ -2673,7 +2816,7 @@ async def reset_ui_cb(callback: types.CallbackQuery):
     u["ui"] = dict(DEFAULT_UI)
     save_db()
     await callback.answer("Уставные вывески возвращены")
-    await safe_answer(callback.message, "🔄 Стандартные вывески конторы восстановлены!", reply_markup=get_main_kb(u))
+    await safe_answer(callback.message, "🔄 Стандартные вывески конторы восстановлены!", reply_markup=get_main_kb(u), u=u)
 
 
 @dp.message(StateFilter(None))
@@ -2685,7 +2828,8 @@ async def fallback_message_handler(message: types.Message):
     await safe_answer(
         message,
         "Уважаемый, выбирайте нужный отдел кнопками внизу или направляйте документ прямо в чат для приобщения к делу!",
-        reply_markup=get_main_kb(u)
+        reply_markup=get_main_kb(u),
+        u=u
     )
     if should_trigger:
         await _send_bottom_challenge(message, u, start_new_series=True)
