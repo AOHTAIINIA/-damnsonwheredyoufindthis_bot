@@ -42,6 +42,7 @@ except ImportError:
 
 load_dotenv()
 
+BOT_VERSION = "1.48"
 DATA_DIR = os.getenv("DATA_DIR", "/app/data" if os.path.exists("/app/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "universal_hub_db.json")
@@ -137,9 +138,12 @@ DEFAULT_UI = {
     "btn_ai": "🤖 Беседа с ИИ",
     "btn_keys": "🔑 Мои ключи API",
     "btn_search": "🔍 Сыск по базе",
+    "btn_notifs": "Уведомления",
     "btn_settings": "⚙️ Вывески и кнопки",
     "btn_ext_a": "🌌 Радиоэфир",
-    "btn_ext_b": "🌻 Декодеры"
+    "btn_ext_b": "🌻 Декодеры",
+    "btn_to_proj": "🚪 В группу «Проекты»",
+    "btn_to_forest": "🌲 В группу «Лес»"
 }
 
 
@@ -151,19 +155,22 @@ def load_db() -> dict:
                 if "users" in data:
                     data.setdefault("public_codes", [])
                     data.setdefault("shared_links", {})
-                    if not data.get("v7_migrated"):
+                    if not data.get("v8_migrated"):
                         for udata in data["users"].values():
                             udata["m_active"] = False
                             udata["m_rounds"] = 0
                             udata["m_lock"] = 0
                             udata["m_deadline"] = 0
                             udata.setdefault("reminders", [])
-                        data["v7_migrated"] = True
+                            udata.setdefault("notifications", [])
+                            udata.setdefault("dump_limit", 5)
+                            udata.setdefault("active_group", "projects")
+                        data["v8_migrated"] = True
                     return data
         except Exception:
             pass
     return {
-        "v7_migrated": True,
+        "v8_migrated": True,
         "users": {},
         "public_codes": [],
         "shared_links": {}
@@ -179,7 +186,7 @@ def _sync_terminal_snapshot(data: dict):
         total_files = 0
         lines = [
             "==========================================================",
-            f"📊 ОТЧЁТ КОНТОРЫ BOTHOST | {sh_now}",
+            f"📊 ОТЧЁТ КОНТОРЫ BOTHOST (v{BOT_VERSION}) | {sh_now}",
             "=========================================================="
         ]
         user_blocks = []
@@ -195,15 +202,23 @@ def _sync_terminal_snapshot(data: dict):
             rem_min = max(0, int((m_lock - time.time()) // 60)) if m_lock > time.time() else 0
             uname = udata.get("username", f"ID_{uid}")
             active_rems = len([r for r in udata.get("reminders", []) if not r.get("done")])
+            d_limit = max(3, min(10, udata.get("dump_limit", 5)))
+            grp = "Лес" if udata.get("active_group") == "forest" else "Проекты"
 
             u_lines = [
-                f"\n👤 Пользователь: {uname} (ID: {uid})",
-                f"   Состояние: индекс={m_val}/100 | раундов={udata.get('m_rounds', 0)} | пауза={rem_min} мин. | кодов={len(udata.get('my_codes', []))} | напоминаний={active_rems}"
+                f"\n👤 Пользователь: {uname} (ID: {uid}) | Группа: {grp}",
+                f"   Состояние: индекс={m_val}/100 | пауза={rem_min} мин. | пагинация дампа={d_limit} шт./стр. | напоминаний={active_rems}"
             ]
             for pid, p in projs.items():
-                u_lines.append(f"   📁 Проект: «{p.get('name', '')}» (файлов: {len(p.get('files', []))})")
-                for f_idx, fitem in enumerate(p.get("files", []), 1):
-                    u_lines.append(f"      📄 №{f_idx}: {fitem.get('name', 'Без имени')} [{fitem.get('date', '')}]")
+                p_files = p.get("files", [])
+                u_lines.append(f"   📁 Проект: «{p.get('name', '')}» (всего файлов: {len(p_files)})")
+                for p_idx in range(0, len(p_files), d_limit):
+                    page_num = (p_idx // d_limit) + 1
+                    chunk = p_files[p_idx:p_idx + d_limit]
+                    u_lines.append(f"      --- Страница {page_num} (по {d_limit} на стр.) ---")
+                    for offset, fitem in enumerate(chunk, 1):
+                        f_num = p_idx + offset
+                        u_lines.append(f"      📄 №{f_num}: {fitem.get('name', 'Без имени')} [{fitem.get('date', '')}]")
             user_blocks.extend(u_lines)
 
         lines.append(f"👥 Всего пользователей в боте: {total_users}")
@@ -242,6 +257,34 @@ def get_shanghai_date() -> str:
     return datetime.now(SH_TZ).strftime("%Y-%m-%d")
 
 
+def add_past_notification(u: dict, title: str, text: str):
+    notifs = u.setdefault("notifications", [])
+    notifs.insert(0, {
+        "id": f"ntf_{uuid.uuid4().hex[:6]}",
+        "title": title[:40],
+        "text": text[:300],
+        "date": datetime.now(MSK_TZ).strftime("%d.%m %H:%M"),
+        "read": False
+    })
+    pending_rems = len([r for r in u.get("reminders", []) if not r.get("done")])
+    max_past = max(1, 15 - pending_rems)
+    if len(notifs) > max_past:
+        u["notifications"] = notifs[:max_past]
+
+
+def has_unread_notifications(u: dict) -> bool:
+    for n in u.get("notifications", []):
+        if not n.get("read"):
+            return True
+    return False
+
+
+def get_notif_btn_label(u: dict) -> str:
+    base = u["ui"].get("btn_notifs", "Уведомления").lstrip("🔴🔔 ")
+    icon = "🔴" if has_unread_notifications(u) else "🔔"
+    return f"{icon} {base}"
+
+
 def get_user(user_obj: types.User) -> dict:
     uid = str(user_obj.id)
     curr_sh_date = get_shanghai_date()
@@ -262,6 +305,7 @@ def get_user(user_obj: types.User) -> dict:
                     "files": [],
                     "active_file": 0,
                     "curr_page": 0,
+                    "dump_page": 0,
                     "ai_history": []
                 }
             },
@@ -271,6 +315,8 @@ def get_user(user_obj: types.User) -> dict:
             "f_ext_a": False,
             "ext_a_loc": "Russia",
             "f_ext_b": False,
+            "active_group": "projects",
+            "dump_limit": 5,
             "m_val": 0,
             "m_date": curr_sh_date,
             "m_active": False,
@@ -280,7 +326,9 @@ def get_user(user_obj: types.User) -> dict:
             "anchor_msg_id": None,
             "last_msg_id": None,
             "msg_ids": [],
-            "reminders": []
+            "reminders": [],
+            "notifications": [],
+            "notif_page": 0
         }
         save_db()
 
@@ -291,6 +339,7 @@ def get_user(user_obj: types.User) -> dict:
             u.setdefault("ui", {})[k] = v
 
     for p in u.get("projects", {}).values():
+        p.setdefault("dump_page", 0)
         if p.get("name") == "Философия и заметки":
             p["name"] = "Основное делопроизводство"
             p["desc"] = "Универсальная папка для документов, исследований и материалов"
@@ -313,6 +362,8 @@ def get_user(user_obj: types.User) -> dict:
     u.setdefault("f_ext_a", False)
     u.setdefault("ext_a_loc", "Russia")
     u.setdefault("f_ext_b", False)
+    u.setdefault("active_group", "projects")
+    u.setdefault("dump_limit", 5)
     u.setdefault("m_val", 0)
     u.setdefault("m_active", False)
     u.setdefault("m_rounds", 0)
@@ -322,6 +373,8 @@ def get_user(user_obj: types.User) -> dict:
     u.setdefault("last_msg_id", None)
     u.setdefault("msg_ids", [])
     u.setdefault("reminders", [])
+    u.setdefault("notifications", [])
+    u.setdefault("notif_page", 0)
 
     if u.get("m_date") != curr_sh_date:
         u["m_date"] = curr_sh_date
@@ -333,6 +386,10 @@ def get_user(user_obj: types.User) -> dict:
         save_db()
 
     return u
+
+
+def is_forest_unlocked(u: dict) -> bool:
+    return bool(u.get("f_ext_a") or u.get("f_ext_b"))
 
 
 def get_active_project(u: dict) -> dict:
@@ -348,6 +405,7 @@ def get_active_project(u: dict) -> dict:
                 "files": [],
                 "active_file": 0,
                 "curr_page": 0,
+                "dump_page": 0,
                 "ai_history": []
             }
         else:
@@ -418,10 +476,12 @@ async def _ensure_anchor_kb(chat_id: int, u: dict, force_refresh: bool = False):
         u["anchor_msg_id"] = None
 
     if not u.get("anchor_msg_id"):
+        grp_label = "🌲 Группа: Лес" if u.get("active_group") == "forest" else "🧭 Группа: Проекты"
+        bar_text = f"*{grp_label} • Сборка v{BOT_VERSION}*"
         try:
             sent = await bot.send_message(
                 chat_id=chat_id,
-                text=f"*{clean_dashes(u['ui']['welcome_title'])}*",
+                text=bar_text,
                 reply_markup=get_main_kb(u),
                 parse_mode="Markdown",
                 link_preview_options=NO_PREVIEW
@@ -523,17 +583,27 @@ async def safe_edit(message: types.Message, text: str, reply_markup=None):
 
 
 def get_welcome_text(u: dict) -> str:
+    if u.get("active_group") == "forest":
+        atmo = _get_random_atmosphere()
+        return (
+            f"🌲 *ГРУППА «ЛЕС» (ВТОРОЙ СЛОЙ • v{BOT_VERSION})*\n\n"
+            f"_{atmo}_\n\n"
+            f"Вы находитесь на частотах второго слоя. Используйте нижнюю панель для переключения между эфиром, декодерами и возвратом в деловой кабинет."
+        )
+
     proj = get_active_project(u)
     ui = u["ui"]
     keys_count = len(u.get("personal_keys", []))
     active_rems = len([r for r in u.get("reminders", []) if not r.get("done")])
+    unread_cnt = len([n for n in u.get("notifications", []) if not n.get("read")])
     return (
         f"*{ui['welcome_title']}*\n"
         f"_{ui['welcome_desc']}_\n\n"
         f"👤 *Удостоверение:* `{u['username']}`\n"
+        f"🧭 *Активная группа:* `Проекты` (v{BOT_VERSION})\n"
         f"📁 *Текущий проект:* `{proj['name']}`\n"
-        f"🗄 *Документов в деле:* *{len(proj['files'])}*\n"
-        f"📅 *Активных напоминаний:* *{active_rems}*\n"
+        f"🗄 *Документов в деле:* *{len(proj['files'])}* (по {u.get('dump_limit', 5)} на стр.)\n"
+        f"🔔 *Уведомления:* Будущих: *{active_rems}* | Непрочитанных: *{unread_cnt}*\n"
         f"💻 *Реестр кодов:* Личных: *{len(u['my_codes'])}* | Общих: *{len(db['public_codes'])}*\n"
         f"🔑 *Ключей API в реестре:* *{keys_count}*"
     )
@@ -776,6 +846,33 @@ def _is_user_locked(u: dict) -> int:
         u["m_lock"] = 0
         save_db()
     return 0
+
+
+async def _perform_full_reset(chat_id: int, u: dict, state: FSMContext, user_msg_id: int = None):
+    _cancel_user_timer(u["id"])
+    await state.clear()
+    u["m_val"] = 0
+    u["m_active"] = False
+    u["m_rounds"] = 0
+    u["m_lock"] = 0
+    u["m_deadline"] = 0
+    await _purge_tracked_messages(
+        chat_id,
+        u,
+        current_msg_id=user_msg_id,
+        deep_sweep=True,
+        keep_anchor=False
+    )
+    save_db()
+    await _ensure_anchor_kb(chat_id, u, force_refresh=True)
+    sent = await bot.send_message(
+        chat_id=chat_id,
+        text=clean_dashes(get_welcome_text(u)),
+        parse_mode="Markdown",
+        link_preview_options=NO_PREVIEW
+    )
+    _track_msg_id(u, sent.message_id)
+    save_db()
 
 
 def build_project_context(proj: dict, u: dict, max_chars: int = 120000) -> str:
@@ -1096,6 +1193,12 @@ async def _reminders_daemon():
                         dt_label = r.get("dt_label", "")
                         files_attached = r.get("files", [])
 
+                        add_past_notification(
+                            udata,
+                            f"⏰ {proj_name}: {comment[:22]}",
+                            f"Сработало напоминание ({dt_label}): {comment} (файлов: {len(files_attached)})"
+                        )
+
                         alert_txt = (
                             f"🔔 *НАПОМИНАНИЕ ПО РАСПИСАНИЮ КОНТОРЫ!*\n\n"
                             f"📁 *Проект:* `{proj_name}`\n"
@@ -1104,35 +1207,40 @@ async def _reminders_daemon():
                             f"📎 *Прикреплено документов:* *{len(files_attached)} шт.*"
                         )
                         try:
-                            await bot.send_message(
+                            await _ensure_anchor_kb(chat_id, udata, force_refresh=True)
+                            sent_alert = await bot.send_message(
                                 chat_id=chat_id,
                                 text=alert_txt,
                                 parse_mode="Markdown",
                                 link_preview_options=NO_PREVIEW
                             )
+                            _track_msg_id(udata, sent_alert.message_id)
                             for fitem in files_attached:
                                 if fitem.get("type") == "photo" and fitem.get("file_id"):
-                                    await bot.send_photo(
+                                    s_f = await bot.send_photo(
                                         chat_id=chat_id,
                                         photo=fitem["file_id"],
                                         caption=f"📸 {fitem.get('name', 'Снимок')} (к напоминанию)"
                                     )
+                                    _track_msg_id(udata, s_f.message_id)
                                 elif fitem.get("file_id"):
-                                    await bot.send_document(
+                                    s_f = await bot.send_document(
                                         chat_id=chat_id,
                                         document=fitem["file_id"],
                                         caption=f"📎 {fitem.get('name', 'Документ')} (к напоминанию)"
                                     )
+                                    _track_msg_id(udata, s_f.message_id)
                                 elif fitem.get("extracted_text"):
                                     buf = BufferedInputFile(
                                         fitem["extracted_text"].encode("utf-8"),
                                         filename=f"{fitem.get('name', 'note')}.md"
                                     )
-                                    await bot.send_document(
+                                    s_f = await bot.send_document(
                                         chat_id=chat_id,
                                         document=buf,
                                         caption=f"📄 {fitem.get('name', 'Запись')} (к напоминанию)"
                                     )
+                                    _track_msg_id(udata, s_f.message_id)
                         except Exception:
                             pass
             if changed:
@@ -1169,19 +1277,24 @@ class HubStates(StatesGroup):
 
 def get_main_kb(u: dict):
     ui = u["ui"]
+    if u.get("active_group") == "forest" and is_forest_unlocked(u):
+        rows = [
+            [KeyboardButton(text=ui["btn_ext_a"]), KeyboardButton(text=ui["btn_ext_b"])],
+            [KeyboardButton(text=ui["btn_settings"]), KeyboardButton(text=ui["btn_to_proj"])]
+        ]
+        return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+
+    notif_label = get_notif_btn_label(u)
     rows = [
         [KeyboardButton(text=ui["btn_projects"]), KeyboardButton(text=ui["btn_dump"])],
         [KeyboardButton(text=ui["btn_reader"]), KeyboardButton(text=ui["btn_codes"])],
         [KeyboardButton(text=ui["btn_ai"]), KeyboardButton(text=ui["btn_keys"])],
-        [KeyboardButton(text=ui["btn_search"]), KeyboardButton(text=ui["btn_settings"])]
+        [KeyboardButton(text=ui["btn_search"]), KeyboardButton(text=notif_label)]
     ]
-    extra_row = []
-    if u.get("f_ext_a"):
-        extra_row.append(KeyboardButton(text=ui["btn_ext_a"]))
-    if u.get("f_ext_b"):
-        extra_row.append(KeyboardButton(text=ui["btn_ext_b"]))
-    if extra_row:
-        rows.append(extra_row)
+    bottom_row = [KeyboardButton(text=ui["btn_settings"])]
+    if is_forest_unlocked(u):
+        bottom_row.append(KeyboardButton(text=ui["btn_to_forest"]))
+    rows.append(bottom_row)
 
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
@@ -1214,28 +1327,7 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
     arg = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd in (_LOCALE_METRICS_BLOB["c_ph"], _LOCALE_METRICS_BLOB["c_dr"]):
-        _cancel_user_timer(u["id"])
-        await state.clear()
-        u["m_val"] = 0
-        u["m_active"] = False
-        u["m_rounds"] = 0
-        u["m_lock"] = 0
-        u["m_deadline"] = 0
-        await _purge_tracked_messages(
-            message.chat.id,
-            u,
-            current_msg_id=message.message_id,
-            deep_sweep=True,
-            keep_anchor=False
-        )
-        save_db()
-        await _ensure_anchor_kb(message.chat.id, u, force_refresh=True)
-        await safe_answer(
-            message,
-            get_welcome_text(u),
-            u=u,
-            cleanup_prev=False
-        )
+        await _perform_full_reset(message.chat.id, u, state, user_msg_id=message.message_id)
         return
 
     if _is_user_locked(u) > 0:
@@ -1252,6 +1344,7 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
     if cmd == _LOCALE_METRICS_BLOB["c_nl"]:
         await state.clear()
         u["f_ext_a"] = True
+        u["active_group"] = "forest"
         if arg:
             u["ext_a_loc"] = arg
         elif not u.get("ext_a_loc"):
@@ -1266,6 +1359,7 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
     if cmd == _LOCALE_METRICS_BLOB["c_sb"]:
         await state.clear()
         u["f_ext_b"] = True
+        u["active_group"] = "forest"
         save_db()
         if _roll_interaction_coins(u):
             await _send_bottom_challenge(message, u, start_new_series=True)
@@ -1312,19 +1406,7 @@ async def _handle_active_challenge_input(message: types.Message, state: FSMConte
             save_db()
             await _send_bottom_challenge(message, u, start_new_series=False)
         else:
-            _cancel_user_timer(u["id"])
-            u["m_active"] = False
-            u["m_rounds"] = 0
-            u["m_deadline"] = 0
-            await _purge_tracked_messages(chat_id, u, current_msg_id=message.message_id, deep_sweep=True, keep_anchor=False)
-            save_db()
-            await _ensure_anchor_kb(chat_id, u, force_refresh=True)
-            await safe_answer(
-                message,
-                get_welcome_text(u),
-                u=u,
-                cleanup_prev=False
-            )
+            await _perform_full_reset(chat_id, u, state, user_msg_id=message.message_id)
     else:
         _cancel_user_timer(u["id"])
         u["m_active"] = False
@@ -1383,9 +1465,15 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
                 "files": [dict(f) for f in shared_pkg.get("files", [])],
                 "active_file": 0,
                 "curr_page": 0,
+                "dump_page": 0,
                 "ai_history": [dict(h) for h in shared_pkg.get("ai_history", [])]
             }
             u["active_project"] = new_pid
+            add_past_notification(
+                u,
+                f"📦 Принят проект «{shared_pkg['name']}»",
+                f"Получен по общей ссылке от @{shared_pkg.get('author', 'коллеги')}"
+            )
             save_db()
             if should_trigger:
                 await _send_bottom_challenge(message, u, start_new_series=True)
@@ -1418,7 +1506,13 @@ def is_menu_button(message: types.Message) -> bool:
     if not message.text or not message.from_user:
         return False
     u = get_user(message.from_user)
-    return message.text in u["ui"].values()
+    txt = message.text.strip()
+    if txt in u["ui"].values():
+        return True
+    base_notif = u["ui"].get("btn_notifs", "Уведомления").lstrip("🔴🔔 ")
+    if txt in (f"🔴 {base_notif}", f"🔔 {base_notif}", "🔴 Уведомления", "🔔 Уведомления"):
+        return True
+    return False
 
 
 @dp.message(is_menu_button, StateFilter("*"))
@@ -1430,9 +1524,18 @@ async def handle_any_menu_button(message: types.Message, state: FSMContext):
         return
 
     ui = u["ui"]
-    txt = message.text
+    txt = message.text.strip()
+    base_notif = ui.get("btn_notifs", "Уведомления").lstrip("🔴🔔 ")
 
-    if txt == ui["btn_projects"]:
+    if txt == ui["btn_to_proj"]:
+        u["active_group"] = "projects"
+        save_db()
+        await safe_answer(message, get_welcome_text(u), u=u, refresh_anchor=True)
+    elif txt == ui["btn_to_forest"] and is_forest_unlocked(u):
+        u["active_group"] = "forest"
+        save_db()
+        await safe_answer(message, get_welcome_text(u), u=u, refresh_anchor=True)
+    elif txt == ui["btn_projects"]:
         await open_projects_menu(message, u)
     elif txt == ui["btn_dump"]:
         await open_dump_menu(message, u)
@@ -1452,12 +1555,215 @@ async def handle_any_menu_button(message: types.Message, state: FSMContext):
             reply_markup=cancel_kb(),
             u=u
         )
+    elif txt in (ui.get("btn_notifs"), f"🔴 {base_notif}", f"🔔 {base_notif}", "🔴 Уведомления", "🔔 Уведомления"):
+        u["notif_page"] = 0
+        save_db()
+        await open_notifications_menu(message, u)
     elif txt == ui["btn_settings"]:
         await open_settings_menu(message, u)
     elif txt == ui["btn_ext_a"] and u.get("f_ext_a"):
         await show_ext_a_hub(message, u)
     elif txt == ui["btn_ext_b"] and u.get("f_ext_b"):
         await show_ext_b_hub(message, u)
+
+
+async def open_notifications_menu(message: types.Message, u: dict, edit_existing: bool = False, refresh_anchor: bool = False):
+    pending_rems = [(idx, r) for idx, r in enumerate(u.get("reminders", [])) if not r.get("done")]
+    past_notifs = u.get("notifications", [])
+
+    max_past_allowed = max(0, 15 - len(pending_rems))
+    if len(past_notifs) > max_past_allowed:
+        u["notifications"] = past_notifs[:max_past_allowed]
+        past_notifs = u["notifications"]
+        save_db()
+
+    combined = []
+    for r_idx, r in pending_rems:
+        combined.append({
+            "kind": "future",
+            "orig_idx": r_idx,
+            "label": f"⏳ [Будущее] {r['dt_label'][:14]} | {r['comment'][:20]}",
+            "cb": f"ntf_fut_{r_idx}",
+            "del_cb": f"ntf_fdel_{r_idx}"
+        })
+    for n_idx, n in enumerate(past_notifs):
+        icon = "🔴" if not n.get("read") else "🔔"
+        combined.append({
+            "kind": "past",
+            "orig_idx": n_idx,
+            "label": f"{icon} [{n.get('date', '')}] {n.get('title', 'Уведомление')[:24]}",
+            "cb": f"ntf_pst_{n_idx}",
+            "del_cb": f"ntf_pdel_{n_idx}"
+        })
+
+    combined = combined[:15]
+    total_items = len(combined)
+    page_size = 8
+    total_pages = 2 if total_items > page_size else 1
+    curr_page = max(0, min(u.get("notif_page", 0), total_pages - 1))
+    u["notif_page"] = curr_page
+
+    start_i = curr_page * page_size
+    end_i = min(start_i + page_size, total_items)
+    page_items = combined[start_i:end_i]
+
+    buttons = []
+    for item in page_items:
+        buttons.append([
+            InlineKeyboardButton(text=item["label"], callback_data=item["cb"]),
+            InlineKeyboardButton(text="🗑", callback_data=item["del_cb"])
+        ])
+
+    if total_pages > 1:
+        nav_row = []
+        if curr_page > 0:
+            nav_row.append(InlineKeyboardButton(text="⬅️ Стр. 1", callback_data="ntf_pg_0"))
+        nav_row.append(InlineKeyboardButton(text=f"📄 Стр. {curr_page+1}/2", callback_data="r_noop"))
+        if curr_page < 1:
+            nav_row.append(InlineKeyboardButton(text="Стр. 2 ➡️", callback_data="ntf_pg_1"))
+        buttons.append(nav_row)
+
+    buttons.append([
+        InlineKeyboardButton(text="✅ Прочитать все", callback_data="ntf_read_all"),
+        InlineKeyboardButton(text="🧹 Очистить прошлые", callback_data="ntf_clear_past")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="📅 Назначить напоминание", callback_data="sch_new")
+    ])
+
+    unread_cnt = len([n for n in past_notifs if not n.get("read")])
+    header_icon = "🔴" if unread_cnt > 0 else "🔔"
+    text = (
+        f"{header_icon} *ЦЕНТР УВЕДОМЛЕНИЙ КОНТОРЫ (СТР. {curr_page+1} ИЗ {total_pages})*\n\n"
+        f"• *Будущих по расписанию:* *{len(pending_rems)}*\n"
+        f"• *Прошлых уведомлений:* *{len(past_notifs)}* (непрочитанных: *{unread_cnt}*)\n"
+        f"• *Всего в журнале:* *{total_items} из 15 макс.*\n\n"
+        f"Нажмите на будущее уведомление для просмотра или отмены, либо на прошлое, шоб прочитать подробности:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit_existing:
+        if refresh_anchor:
+            await _ensure_anchor_kb(message.chat.id, u, force_refresh=True)
+        await safe_edit(message, text, reply_markup=kb)
+    else:
+        await safe_answer(message, text, reply_markup=kb, u=u, refresh_anchor=refresh_anchor)
+
+
+@dp.callback_query(F.data.startswith("ntf_pg_"))
+async def notif_page_switch_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    pg = int(callback.data.replace("ntf_pg_", ""))
+    u["notif_page"] = max(0, min(pg, 1))
+    save_db()
+    await open_notifications_menu(callback.message, u, edit_existing=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "ntf_read_all")
+async def notif_read_all_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    for n in u.get("notifications", []):
+        n["read"] = True
+    save_db()
+    await callback.answer("Все уведомления отмечены прочитанными!")
+    await open_notifications_menu(callback.message, u, edit_existing=True, refresh_anchor=True)
+
+
+@dp.callback_query(F.data == "ntf_clear_past")
+async def notif_clear_past_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    u["notifications"] = []
+    u["notif_page"] = 0
+    save_db()
+    await callback.answer("Прошлые уведомления очищены!")
+    await open_notifications_menu(callback.message, u, edit_existing=True, refresh_anchor=True)
+
+
+@dp.callback_query(F.data.startswith("ntf_fut_"))
+async def notif_view_future_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    idx = int(callback.data.replace("ntf_fut_", ""))
+    rems = u.get("reminders", [])
+    if not (0 <= idx < len(rems)):
+        await callback.answer("Не найдено")
+        return
+    r = rems[idx]
+    f_names = [f"• `{f.get('name', 'Файл')}`" for f in r.get("files", [])]
+    files_block = "\n".join(f_names) if f_names else "_(без прикреплённых файлов)_"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить это напоминание", callback_data=f"ntf_fdel_{idx}")],
+        [InlineKeyboardButton(text="⬅️ Назад к уведомлениям", callback_data="ntf_back")]
+    ])
+    text = (
+        f"⏳ *Будущее уведомление (По расписанию)*\n\n"
+        f"📁 *Проект:* `{r.get('proj_name', '')}`\n"
+        f"🕒 *Назначено на:* `{r.get('dt_label', '')}`\n"
+        f"📝 *Комментарий:* {r.get('comment', '')}\n\n"
+        f"📎 *Файлы к выгрузке ({len(f_names)}):*\n{files_block}"
+    )
+    await safe_edit(callback.message, text, reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("ntf_pst_"))
+async def notif_view_past_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    idx = int(callback.data.replace("ntf_pst_", ""))
+    notifs = u.get("notifications", [])
+    if not (0 <= idx < len(notifs)):
+        await callback.answer("Не найдено")
+        return
+    was_unread = not notifs[idx].get("read")
+    notifs[idx]["read"] = True
+    save_db()
+    if was_unread:
+        await _ensure_anchor_kb(callback.message.chat.id, u, force_refresh=True)
+
+    n = notifs[idx]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить уведомление", callback_data=f"ntf_pdel_{idx}")],
+        [InlineKeyboardButton(text="⬅️ Назад к уведомлениям", callback_data="ntf_back")]
+    ])
+    text = (
+        f"🔔 *Прошлое уведомление (Прочитано)*\n\n"
+        f"🏷 *Заголовок:* *{n.get('title', '')}*\n"
+        f"🕒 *Время:* `{n.get('date', '')}`\n\n"
+        f"📝 *Подробности:*\n{n.get('text', '')}"
+    )
+    await safe_edit(callback.message, text, reply_markup=kb)
+    await callback.answer("Отмечено как прочитанное")
+
+
+@dp.callback_query(F.data.startswith("ntf_fdel_"))
+async def notif_del_future_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    idx = int(callback.data.replace("ntf_fdel_", ""))
+    rems = u.get("reminders", [])
+    if 0 <= idx < len(rems):
+        removed = rems.pop(idx)
+        add_past_notification(u, f"❌ Отменено: {removed.get('comment', '')[:20]}", f"Будущее напоминание на {removed.get('dt_label', '')} было отменено.")
+        save_db()
+        await callback.answer("Будущее напоминание отменено!")
+    await open_notifications_menu(callback.message, u, edit_existing=True, refresh_anchor=True)
+
+
+@dp.callback_query(F.data.startswith("ntf_pdel_"))
+async def notif_del_past_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    idx = int(callback.data.replace("ntf_pdel_", ""))
+    notifs = u.get("notifications", [])
+    if 0 <= idx < len(notifs):
+        notifs.pop(idx)
+        save_db()
+        await callback.answer("Уведомление удалено!")
+    await open_notifications_menu(callback.message, u, edit_existing=True, refresh_anchor=True)
+
+
+@dp.callback_query(F.data == "ntf_back")
+async def notif_back_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    await open_notifications_menu(callback.message, u, edit_existing=True)
+    await callback.answer()
 
 
 async def show_ext_a_hub(message: types.Message, u: dict, edit_existing: bool = False, refresh_anchor: bool = False):
@@ -2110,6 +2416,7 @@ async def new_proj_done(message: types.Message, state: FSMContext):
         "files": [],
         "active_file": 0,
         "curr_page": 0,
+        "dump_page": 0,
         "ai_history": []
     }
     u["active_project"] = pid
@@ -2215,8 +2522,21 @@ async def exp_proj_cb(callback: types.CallbackQuery):
 
 async def open_dump_menu(message: types.Message, u: dict, edit_existing: bool = False):
     proj = get_active_project(u)
+    files = proj.get("files", [])
+    total_files = len(files)
+    limit = max(3, min(10, u.get("dump_limit", 5)))
+    u["dump_limit"] = limit
+
+    total_pages = max(1, (total_files + limit - 1) // limit)
+    curr_page = max(0, min(proj.get("dump_page", 0), total_pages - 1))
+    proj["dump_page"] = curr_page
+
+    start_i = curr_page * limit
+    end_i = min(start_i + limit, total_files)
+
     buttons = []
-    for idx, fitem in enumerate(proj["files"][-15:], max(0, len(proj["files"]) - 15)):
+    for idx in range(start_i, end_i):
+        fitem = files[idx]
         icon = "📸" if fitem["type"] == "photo" else ("📄" if fitem.get("extracted_text") else "📦")
         buttons.append([
             InlineKeyboardButton(text=f"{icon} №{idx+1} {fitem['name'][:26]}", callback_data=f"fvw_{idx}"),
@@ -2224,6 +2544,21 @@ async def open_dump_menu(message: types.Message, u: dict, edit_existing: bool = 
             InlineKeyboardButton(text="🗑", callback_data=f"fdelask_{idx}")
         ])
 
+    if total_pages > 1:
+        nav_row = []
+        if curr_page > 0:
+            nav_row.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"dmpg_{curr_page-1}"))
+        nav_row.append(InlineKeyboardButton(text=f"📄 Стр. {curr_page+1}/{total_pages}", callback_data="r_noop"))
+        if curr_page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"dmpg_{curr_page+1}"))
+        buttons.append(nav_row)
+
+    buttons.append([
+        InlineKeyboardButton(
+            text=f"🔢 На странице: {limit} шт. (выбрать от 3 до 10)",
+            callback_data="dmlim_menu"
+        )
+    ])
     buttons.append([
         InlineKeyboardButton(text="➕ Внести текстовую запись", callback_data="f_add_note"),
         InlineKeyboardButton(text="🌐 Выгрузить по веб-ссылке", callback_data="f_imp_url")
@@ -2231,7 +2566,7 @@ async def open_dump_menu(message: types.Message, u: dict, edit_existing: bool = 
     buttons.append([
         InlineKeyboardButton(text="📅 Назначить напоминание по файлам", callback_data="sch_new")
     ])
-    if proj["files"]:
+    if total_files > 0:
         buttons.append([
             InlineKeyboardButton(text="🔗 Поделиться в чате", callback_data="p_share_link"),
             InlineKeyboardButton(text="🧹 Очистить архив", callback_data="f_clear_ask")
@@ -2239,15 +2574,66 @@ async def open_dump_menu(message: types.Message, u: dict, edit_existing: bool = 
 
     text = (
         f"🗄 *АРХИВ ДОКУМЕНТОВ ПРОЕКТА «{proj['name']}»*\n\n"
-        f"Всего единиц хранения в папке: *{len(proj['files'])}*\n"
-        f"• *Как пополнить архив:* направляйте прямо в этот чат любые файлы (`.pdf`, `.docx`, `.pptx`, `.md`, `.json`, `.txt`, архивы или снимки).\n"
-        f"• Текстовая часть документов автоматически индексируется для Читального зала и Консультанта ИИ:"
+        f"• *Всего единиц хранения:* *{total_files}*\n"
+        f"• *Страница:* *{curr_page+1} из {total_pages}* (отображается по *{limit}* шт. на стр.)\n\n"
+        f"Направляйте прямо в этот чат любые файлы (`.pdf`, `.docx`, `.pptx`, `.md`, `.json`, `.txt`, архивы или снимки), и они автоматически разложатся по страницам:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit_existing:
         await safe_edit(message, text, reply_markup=kb)
     else:
         await safe_answer(message, text, reply_markup=kb, u=u)
+
+
+@dp.callback_query(F.data.startswith("dmpg_"))
+async def dump_page_switch_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    proj = get_active_project(u)
+    pg = int(callback.data.replace("dmpg_", ""))
+    proj["dump_page"] = max(0, pg)
+    save_db()
+    await open_dump_menu(callback.message, u, edit_existing=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "dmlim_menu")
+async def dump_limit_menu_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    curr = u.get("dump_limit", 5)
+    row1 = []
+    row2 = []
+    for val in range(3, 7):
+        mark = "✅ " if val == curr else ""
+        row1.append(InlineKeyboardButton(text=f"{mark}{val}", callback_data=f"dmlim_set_{val}"))
+    for val in range(7, 11):
+        mark = "✅ " if val == curr else ""
+        row2.append(InlineKeyboardButton(text=f"{mark}{val}", callback_data=f"dmlim_set_{val}"))
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        row1,
+        row2,
+        [InlineKeyboardButton(text="⬅️ Назад в архив", callback_data="fdelno")]
+    ])
+    await safe_edit(
+        callback.message,
+        f"🔢 *НАСТРОЙКА ПАГИНАЦИИ АРХИВА*\n\n"
+        f"Сейчас на одной странице отображается и логируется: *{curr} файл(ов)*.\n"
+        f"Выберите нужное количество от 3 до 10:",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("dmlim_set_"))
+async def dump_limit_set_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    proj = get_active_project(u)
+    val = int(callback.data.replace("dmlim_set_", ""))
+    u["dump_limit"] = max(3, min(10, val))
+    proj["dump_page"] = 0
+    save_db()
+    await callback.answer(f"Установлено: по {u['dump_limit']} шт. на странице")
+    await open_dump_menu(callback.message, u, edit_existing=True)
 
 
 @dp.callback_query(F.data == "f_imp_url")
@@ -2298,8 +2684,11 @@ async def import_url_done(message: types.Message, state: FSMContext):
             "pages": pages,
             "date": datetime.now().strftime("%d.%m %H:%M")
         })
+        limit = max(3, min(10, u.get("dump_limit", 5)))
+        proj["dump_page"] = (len(proj["files"]) - 1) // limit
         proj["active_file"] = len(proj["files"]) - 1
         proj["curr_page"] = 0
+        add_past_notification(u, f"🌐 Импорт: {page_title[:22]}", f"Добавлен материал по ссылке в проект «{proj['name']}»")
         save_db()
         if _roll_interaction_coins(u):
             await _send_bottom_challenge(message, u, start_new_series=True)
@@ -2336,34 +2725,18 @@ async def handle_any_document_dump(message: types.Message, state: FSMContext):
         "pages": pages,
         "date": datetime.now().strftime("%d.%m %H:%M")
     })
+    limit = max(3, min(10, u.get("dump_limit", 5)))
+    proj["dump_page"] = (len(proj["files"]) - 1) // limit
     proj["active_file"] = len(proj["files"]) - 1
     proj["curr_page"] = 0
+    add_past_notification(u, f"📄 Загружен: {fname[:22]}", f"Файл добавлен в проект «{proj['name']}» (стр. {proj['dump_page']+1})")
     save_db()
 
     if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
         return
 
-    idx = len(proj["files"]) - 1
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📑 Читать в зале", callback_data=f"fvw_{idx}"),
-            InlineKeyboardButton(text="🤖 Обсудить с ИИ", callback_data=f"fai_{idx}")
-        ],
-        [
-            InlineKeyboardButton(text="📅 Напомнить по файлу", callback_data="sch_new"),
-            InlineKeyboardButton(text="🗄 Весь архив", callback_data="fdelno")
-        ]
-    ])
-    status_txt = f"Извлечено текста: *{len(extracted_text)} симв.* ({len(pages)} стр.)" if extracted_text else "Принят на хранение как оригинал"
-    await safe_answer(
-        message,
-        f"✅ *Документ `{fname}` зарегистрирован в проекте «{proj['name']}».*\n"
-        f"📊 {status_txt}",
-        reply_markup=kb,
-        u=u,
-        cleanup_prev=True
-    )
+    await open_dump_menu(message, u)
 
 
 @dp.message(F.photo, StateFilter("*"))
@@ -2393,26 +2766,15 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
         "pages": [f"📸 Изображение: {caption}"],
         "date": datetime.now().strftime("%d.%m %H:%M")
     })
+    limit = max(3, min(10, u.get("dump_limit", 5)))
+    proj["dump_page"] = (len(proj["files"]) - 1) // limit
+    add_past_notification(u, f"📸 Снимок: {caption[:22]}", f"Изображение подшито в проект «{proj['name']}»")
     save_db()
     if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
         return
 
-    idx = len(proj["files"]) - 1
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤖 Направить снимок консультанту ИИ", callback_data=f"fvision_{idx}")],
-        [
-            InlineKeyboardButton(text="📅 Напомнить", callback_data="sch_new"),
-            InlineKeyboardButton(text="🗄 Открыть архив", callback_data="fdelno")
-        ]
-    ])
-    await safe_answer(
-        message,
-        f"📸 *Снимок подшит к материалам проекта «{proj['name']}»!*\n📝 Пометка: _{caption}_",
-        reply_markup=kb,
-        u=u,
-        cleanup_prev=True
-    )
+    await open_dump_menu(message, u)
 
 
 @dp.callback_query(F.data.startswith("fvision_"))
@@ -2516,6 +2878,7 @@ async def clear_project_dump_yes_cb(callback: types.CallbackQuery):
     proj["files"] = []
     proj["active_file"] = 0
     proj["curr_page"] = 0
+    proj["dump_page"] = 0
     save_db()
     await callback.answer("Архив проекта очищен")
     await open_dump_menu(callback.message, u, edit_existing=True)
@@ -2553,8 +2916,11 @@ async def add_text_note_done(message: types.Message, state: FSMContext):
             "pages": split_into_pages(txt),
             "date": datetime.now().strftime("%d.%m %H:%M")
         })
+        limit = max(3, min(10, u.get("dump_limit", 5)))
+        proj["dump_page"] = (len(proj["files"]) - 1) // limit
         proj["active_file"] = len(proj["files"]) - 1
         proj["curr_page"] = 0
+        add_past_notification(u, f"📝 Запись: {title[:22]}", f"Текстовая заметка подшита в проект «{proj['name']}»")
         save_db()
     if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
@@ -3078,6 +3444,8 @@ async def save_last_ai_to_dump_cb(callback: types.CallbackQuery):
             "pages": split_into_pages(last_ans),
             "date": datetime.now().strftime("%d.%m %H:%M")
         })
+        limit = max(3, min(10, u.get("dump_limit", 5)))
+        proj["dump_page"] = (len(proj["files"]) - 1) // limit
         save_db()
         await callback.answer("✅ Заключение подшито в Архив проекта!", show_alert=True)
     else:
@@ -3356,28 +3724,76 @@ UI_LABELS = {
     "btn_ai": "Кнопка 5 (Беседа с ИИ)",
     "btn_keys": "Кнопка 6 (Ключи API)",
     "btn_search": "Кнопка 7 (Сыск)",
-    "btn_settings": "Кнопка 8 (Настройки)"
+    "btn_notifs": "Кнопка 8 (Уведомления)",
+    "btn_settings": "Кнопка 9 (Настройки)"
 }
 
 
 async def open_settings_menu(message: types.Message, u: dict, edit_existing: bool = False):
     ui = u["ui"]
-    buttons = []
+    curr_grp = "🌲 Лес (2 слой)" if u.get("active_group") == "forest" else "🧭 Проекты (1 слой)"
+    buttons = [
+        [InlineKeyboardButton(text="🛠 Сброс состояния (Анти-софтлок)", callback_data="ui_soft_reset")]
+    ]
+
+    if is_forest_unlocked(u):
+        buttons.append([
+            InlineKeyboardButton(text="🧭 Группа «Проекты»", callback_data="grp_set_projects"),
+            InlineKeyboardButton(text="🌲 Группа «Лес»", callback_data="grp_set_forest")
+        ])
+    if u.get("active_group") == "forest":
+        buttons.append([
+            InlineKeyboardButton(text="🚪 Выйти обратно в группу «Проекты»", callback_data="grp_set_projects")
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text=f"🔢 Пагинация дампа: {u.get('dump_limit', 5)} шт./стр.",
+            callback_data="dmlim_menu"
+        )
+    ])
+
     for k, label in UI_LABELS.items():
-        curr_val = ui.get(k, "")[:22]
+        curr_val = ui.get(k, "")[:20]
         buttons.append([InlineKeyboardButton(text=f"✏️ {label}: «{curr_val}»", callback_data=f"uied_{k}")])
 
     buttons.append([InlineKeyboardButton(text="🔄 Восстановить уставные вывески конторы", callback_data="ui_reset")])
 
     text = (
-        "⚙️ *УПРАВЛЕНИЕ ВЫВЕСКАМИ И КНОПКАМИ КАБИНЕТА*\n\n"
-        "Желаете переименовать разделы на свой вкус? Выбирайте нужный пункт ниже:"
+        f"⚙️ *НАСТРОЙКИ И УПРАВЛЕНИЕ КАБИНЕТОМ*\n\n"
+        f"📦 *Текущая версия бота:* `{BOT_VERSION}`\n"
+        f"🧭 *Активная группа:* *{curr_grp}*\n"
+        f"🗄 *Файлов на странице дампа:* *{u.get('dump_limit', 5)} шт.*\n\n"
+        f"Используйте кнопки ниже для сброса состояния, переключения рабочей группы или переименования вывесок:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit_existing:
         await safe_edit(message, text, reply_markup=kb)
     else:
         await safe_answer(message, text, reply_markup=kb, u=u)
+
+
+@dp.callback_query(F.data == "ui_soft_reset", StateFilter("*"))
+async def ui_soft_reset_cb(callback: types.CallbackQuery, state: FSMContext):
+    u = get_user(callback.from_user)
+    await callback.answer("Выполняю полный сброс интерфейса...")
+    await _perform_full_reset(callback.message.chat.id, u, state)
+
+
+@dp.callback_query(F.data.startswith("grp_set_"), StateFilter("*"))
+async def switch_group_cb(callback: types.CallbackQuery, state: FSMContext):
+    u = get_user(callback.from_user)
+    target_grp = callback.data.replace("grp_set_", "")
+    if target_grp == "forest" and not is_forest_unlocked(u):
+        await callback.answer("Вторая группа ещё не открыта!", show_alert=True)
+        return
+    u["active_group"] = "forest" if target_grp == "forest" else "projects"
+    save_db()
+    await state.clear()
+    grp_title = "Лес" if u["active_group"] == "forest" else "Проекты"
+    await callback.answer(f"Переключено в группу «{grp_title}»!")
+    await _ensure_anchor_kb(callback.message.chat.id, u, force_refresh=True)
+    await safe_edit(callback.message, get_welcome_text(u))
 
 
 @dp.callback_query(F.data.startswith("uied_"))
@@ -3410,12 +3826,8 @@ async def edit_ui_done(message: types.Message, state: FSMContext):
     if _roll_interaction_coins(u):
         await _send_bottom_challenge(message, u, start_new_series=True)
         return
-    await safe_answer(
-        message,
-        "✅ Новая вывеска утверждена!",
-        u=u,
-        refresh_anchor=True
-    )
+    await _ensure_anchor_kb(message.chat.id, u, force_refresh=True)
+    await open_settings_menu(message, u)
 
 
 @dp.callback_query(F.data == "ui_reset")
@@ -3424,12 +3836,8 @@ async def reset_ui_cb(callback: types.CallbackQuery):
     u["ui"] = dict(DEFAULT_UI)
     save_db()
     await callback.answer("Уставные вывески возвращены")
-    await safe_answer(
-        callback.message,
-        "🔄 Стандартные вывески конторы восстановлены!",
-        u=u,
-        refresh_anchor=True
-    )
+    await _ensure_anchor_kb(callback.message.chat.id, u, force_refresh=True)
+    await open_settings_menu(callback.message, u, edit_existing=True)
 
 
 @dp.message(StateFilter(None))
@@ -3458,7 +3866,7 @@ async def main():
     try:
         me = await bot.get_me()
         BOT_USERNAME = me.username
-        print(f"Ready: @{me.username} | {STAT_FILE}")
+        print(f"Ready v{BOT_VERSION}: @{me.username} | {STAT_FILE}")
         await dp.start_polling(bot)
     finally:
         rem_task.cancel()
