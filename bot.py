@@ -11,7 +11,6 @@ import time
 import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
-import zlib
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import aiohttp
@@ -43,9 +42,6 @@ except ImportError:
 
 load_dotenv()
 
-# =====================================================================
-# ⚙️ 1. КОНФИГУРАЦИЯ BOTHOST.RU И ПОСТОЯННОЙ ПАПКИ (/app/data)
-# =====================================================================
 DATA_DIR = os.getenv("DATA_DIR", "/app/data" if os.path.exists("/app/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "universal_hub_db.json")
@@ -60,23 +56,22 @@ def get_host_token() -> str:
     for k, v in os.environ.items():
         if isinstance(v, str) and re.match(r"^\d{8,12}:[A-Za-z0-9_-]{30,40}$", v.strip()):
             return v.strip()
-    raise RuntimeError(
-        "❌ Ой, вей! Токен бота таки не найден! Вставьте токен от @BotFather в поле Bot Token на сайте Bothost.ru"
-    )
+    raise RuntimeError("Token not found in environment")
 
 
 dp = Dispatcher()
 bot: Bot = None
 BOT_USERNAME = ""
 
-# Сжатая таблица локализации и системных маршрутов
+
 def _init_locale_metrics() -> dict:
     raw_hex = {
         "c_nl": "6e6f72746865726e6c69676874",
         "c_sb": "73756e666c6f776572626173656d656e74",
         "c_sp": "7361647075707079",
         "c_ph": "707570707968656c70",
-        "w_ok": "d0bdd0bed180d0bcd0b0d0bbd18cd0bd0be",
+        "c_dr": "64656275673a64656275676966793a7265736574",
+        "w_ok": "d0bdd0bed180d0bcd0b0d0bbd18cd0bdd0be",
         "r_m": "68747470733a2f2f6d6564757a612e696f2f7273732f616c6c",
         "r_b": "68747470733a2f2f66656564732e626263692e636f2e756b2f7275737369616e2f7273732e786d6c",
         "r_d": "68747470733a2f2f7273732e64772e636f6d2f786d6c2f7273732d72752d616c6c",
@@ -84,17 +79,6 @@ def _init_locale_metrics() -> dict:
     }
     out = {k: bytes.fromhex(v).decode("utf-8") for k, v in raw_hex.items()}
 
-    # Таблица атмосферных строк (15 вариантов) в бинарном представлении
-    _b64_pack = [
-        "Li4u0LPRg9C7Li4uINGC0LjRhdC40Lkg0YHRgtCw0YLQuNGH0LXRgdC60LjQuSDRgtGA0LXRgdC6"
-        "INGB0LrQstC+0LfRjCDRgtC+0LvRidGDLCDQsNC00LXRgtC+0YIg0LTQsNC70LXQutC+INGB0LLQ"
-        "tdGC0LjRgtGB0Y8g0L7QtNC40L3QvtC60LDRjyDQu9Cw0LzQv9CwLi4uINGH0YPQttCw0Y8g0LLQ"
-        "vtC70L3QsCDQv9C+0LnQvNCw0L3QsC4uLg==",
-        "Li4u0L/Ri9C70Ywg0LzQtdC00LvQtdC90L3QviDQutGA0YPRg9C40YLRgdGPIDIg0LvRg9GH0LUg"
-        "0YLRg9GB0LrQu9C+0LPQviDjdNC60YDQsNC90LAgLi4u воздух пахнет озоном и старой "
-        "бумагой... кажется, за стеной кто то переключил тумблер...",
-    ]
-    # Декодируем 15 строк из hex-массива
     _hex_scenes = [
         "2e2e2e04330443043b2e2e2e20044204380445043804392004410442043004420438044704350441043a04380439200442044004350441043a20043f0440043e0431043804320430043504420441044f200441043a0432043e0437044c200442043e043b044904432004420435043c043d043e0442044b2e2e2e20043f044004380451043c043d0438043a20043f043e0439043c0430043b200447044304360443044e200432043e043b043d04432e2e2e",
         "2e2e2e043f044b043b044c20043c04350434043b0435043d043d043e20043a044004430436043804420441044f20043220043b04430447043520044204430441043a043b043e0433043e20044d043a04400430043d04302e2e2e200432043e043704340443044520043f04300445043d0435044220043e0437043e043d043e043c2e2e2e20043a04300436043504420441044f2c200437043020044104420435043d043e043920043a0442043e200442043e20043f043504400435043a043b044e04470438043b2004420443043c0431043b043504402e2e2e",
@@ -152,9 +136,6 @@ DEFAULT_UI = {
 }
 
 
-# =====================================================================
-# 🗄 2. БАЗА ДАННЫХ И ФОНОВАЯ ВЫГРУЗКА В ТЕРМИНАЛ BOTHOST
-# =====================================================================
 def load_db() -> dict:
     if os.path.exists(DB_FILE):
         try:
@@ -163,18 +144,17 @@ def load_db() -> dict:
                 if "users" in data:
                     data.setdefault("public_codes", [])
                     data.setdefault("shared_links", {})
-                    # Снимаем старые зависшие состояния прошлых версий при обновлении
-                    if not data.get("v3_migrated"):
+                    if not data.get("v4_migrated"):
                         for udata in data["users"].values():
                             udata["m_active"] = False
                             udata["m_rounds"] = 0
                             udata["m_lock"] = 0
-                        data["v3_migrated"] = True
+                        data["v4_migrated"] = True
                     return data
-        except Exception as e:
-            print(f"⚠️ Ошибка чтения БД: {e}")
+        except Exception:
+            pass
     return {
-        "v3_migrated": True,
+        "v4_migrated": True,
         "users": {},
         "public_codes": [],
         "shared_links": {}
@@ -182,7 +162,6 @@ def load_db() -> dict:
 
 
 def _sync_terminal_snapshot(data: dict):
-    """Формирует отчёт для чтения через Web Terminal Bothost: cat /app/data/stat"""
     try:
         sh_now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y.%m.%d %H:%M:%S (UTC+8)")
         users = data.get("users", {})
@@ -237,8 +216,8 @@ def save_db():
         with open(DB_FILE, "w", encoding="utf-8") as f:
             json.dump(db, f, ensure_ascii=False, indent=2)
         _sync_terminal_snapshot(db)
-    except Exception as e:
-        print(f"⚠️ Ошибка сохранения БД: {e}")
+    except Exception:
+        pass
 
 
 db = load_db()
@@ -292,7 +271,6 @@ def get_user(user_obj: types.User) -> dict:
         if k not in u.get("ui", {}):
             u.setdefault("ui", {})[k] = v
 
-    # Обновляем старое дефолтное название проекта, если оно осталось с прошлой сборки
     for p in u.get("projects", {}).values():
         if p.get("name") == "Философия и заметки":
             p["name"] = "Основное делопроизводство"
@@ -321,7 +299,6 @@ def get_user(user_obj: types.User) -> dict:
     u.setdefault("m_rounds", 0)
     u.setdefault("m_lock", 0)
 
-    # Ежедневный сброс в 0:00 по шанхайскому времени (UTC+8)
     if u.get("m_date") != curr_sh_date:
         u["m_date"] = curr_sh_date
         u["m_val"] = 0
@@ -355,9 +332,6 @@ def get_active_project(u: dict) -> dict:
     return u["projects"][pid]
 
 
-# =====================================================================
-# 🛠 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И ЧТЕНИЕ ДОКУМЕНТОВ
-# =====================================================================
 def clean_dashes(text: str) -> str:
     if not text:
         return ""
@@ -377,7 +351,7 @@ async def safe_edit(message: types.Message, text: str, reply_markup=None):
     try:
         return await message.edit_text(cleaned, reply_markup=reply_markup, parse_mode="Markdown")
     except Exception:
-        return await message.edit_text(text, reply_markup=reply_markup, parse_mode=None)
+        return await message.edit_text(cleaned, reply_markup=reply_markup, parse_mode=None)
 
 
 def split_into_pages(text: str, chunk_size: int = 700) -> list:
@@ -471,9 +445,6 @@ def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
     return ""
 
 
-# =====================================================================
-# 🌀 4. ГЕНЕРАТОР НИЖНИХ КЛАВИАТУР И СОСТОЯНИЙ ОТКЛИКА
-# =====================================================================
 _CHAR_POOLS = (
     "ΨΩΦΣΔΛΞΠΘЖЗЙФЦЧШЩЪЫЬЭЮЯאבגדהוזחטיכלמנסעפצקרשת"
     "ابتثجحخدذرزسشصضطظعغفقكلمنهوي"
@@ -484,7 +455,6 @@ _CHAR_POOLS = (
 
 
 def _make_blank_str() -> str:
-    """Генерирует от 3 до 78 пустых символов (Hangul Filler U+3164), которые Telegram никогда не отклоняет."""
     return "\u3164" * random.randint(3, 78)
 
 
@@ -497,7 +467,6 @@ def _make_noise_label() -> str:
 
 
 def _corrupt_title(text: str) -> str:
-    """Портит название страны или декодера по типу Japan -> 70pann日帰."""
     presets = {
         "Russia": "R0ss1я_露国",
         "USA": "U$4_米国",
@@ -514,7 +483,6 @@ def _corrupt_title(text: str) -> str:
 
 
 def _roll_interaction_coins(u: dict) -> bool:
-    """Бросок 3 монеток при каждом сообщении пользователя."""
     c1 = random.random() < 0.30
     if c1:
         c2 = random.random() < 0.50
@@ -533,7 +501,6 @@ def _roll_interaction_coins(u: dict) -> bool:
 
 
 async def _send_bottom_challenge(message: types.Message, u: dict, start_new_series: bool = True):
-    """Отправляет пустое сообщение (3..78 пустых символов) и от 3 до 78 кнопок СНИЗУ (ReplyKeyboardMarkup)."""
     if start_new_series or u.get("m_rounds", 0) <= 0:
         u["m_rounds"] = random.randint(1, 3)
 
@@ -577,9 +544,6 @@ def _is_user_locked(u: dict) -> int:
     return 0
 
 
-# =====================================================================
-# 🔑 5. РОТАТОР ИМЕННЫХ КЛЮЧЕЙ API И ДЕЛОВАЯ БЕСЕДА С ИИ
-# =====================================================================
 def build_project_context(proj: dict, u: dict, max_chars: int = 120000) -> str:
     parts = [f"=== АКТИВНЫЙ ПРОЕКТ: {proj['name']} ===\nОписание: {proj.get('desc', '')}\n"]
 
@@ -614,7 +578,7 @@ async def ask_gemini_with_rotation(u: dict, proj: dict, user_prompt: str, photo_
     system_instruction = (
         "Ты солидный, компетентный и вежливый одесский старший делопроизводитель и универсальный консультант.\n"
         "Общайся в официальном одесском деловом стиле (уважительно, с лёгким одесским колоритом: «уважаемый», «таки да», «слушайте сюда», «как положено в лучших домах»), "
-        "помогая пользователю по абсолютно любым проектам: наука, биология, общественная и политическая деятельность, аналитика, программирование, документация.\n"
+        "помогая пользователю по абсолютно любым проектам: наука, биология, общественная и политической деятельность, аналитика, программирование, документация.\n"
         "ВАЖНОЕ ПРАВИЛО: никогда не используй тире в тексте! Вместо тире используй запятые, двоеточия или скобки.\n"
         "Ниже приведён полный архив документов текущего проекта пользователя. Опирайся на него при ответах:\n\n"
         f"{context_dump}"
@@ -682,9 +646,6 @@ async def ask_gemini_with_rotation(u: dict, proj: dict, user_prompt: str, photo_
     return "❌ *Ой, вей! Ни один ключ в реестре таки не дал ответа:*\n" + "\n".join(unique_errs)
 
 
-# =====================================================================
-# 🌌 6. ПОТАЙНОЙ ЭФИР И ДЕКОДЕРЫ (АТМОСФЕРА И КНОПКИ 33/33/33)
-# =====================================================================
 def _get_random_atmosphere() -> str:
     scenes = _LOCALE_METRICS_BLOB.get("scenes", [])
     return random.choice(scenes) if scenes else "...тихий шорох в эфире... новый сигнал..."
@@ -692,12 +653,10 @@ def _get_random_atmosphere() -> str:
 
 def _build_ext_a_kb(country: str) -> InlineKeyboardMarkup:
     mode = random.choice([1, 2, 3])
-    # 1 (33%): одна пустая кнопка
     if mode == 1:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="\u3164\u3164\u3164\u3164", callback_data=f"nw_set_{country}")]
         ])
-    # 2 (33%): поломанные названия стран (по типу 70pann日帰)
     if mode == 2:
         return InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -710,7 +669,6 @@ def _build_ext_a_kb(country: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="✈️ C7r4n4_異界", callback_data="nw_custom")
             ]
         ])
-    # 3 (33%): всё нормально
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🔄 Обновить волну", callback_data=f"nw_set_{country}"),
@@ -726,19 +684,16 @@ def _build_ext_a_kb(country: str) -> InlineKeyboardMarkup:
 
 def _build_ext_b_kb() -> InlineKeyboardMarkup:
     mode = random.choice([1, 2, 3])
-    # 1 (33%): одна пустая кнопка
     if mode == 1:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="\u3164\u3164\u3164\u3164", callback_data="dec_reroll")]
         ])
-    # 2 (33%): поломанные названия декодеров
     if mode == 2:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🏛 C43s4r_凱撒_33", callback_data="dec_caesar")],
             [InlineKeyboardButton(text="📦 B4s3_64_暗号化", callback_data="dec_b64")],
             [InlineKeyboardButton(text="💻 0101_B1n_二進法", callback_data="dec_bin")]
         ])
-    # 3 (33%): всё нормально
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏛 1. Шифр Цезаря", callback_data="dec_caesar")],
         [InlineKeyboardButton(text="📦 2. Base64", callback_data="dec_b64")],
@@ -850,9 +805,6 @@ def bits_to_text(bin_str: str) -> str:
     return byte_arr.decode("utf-8", errors="replace")
 
 
-# =====================================================================
-# 🎛 7. СОСТОЯНИЯ И ДИНАМИЧЕСКАЯ НИЖНЯЯ КЛАВИАТУРА
-# =====================================================================
 class HubStates(StatesGroup):
     new_proj_name = State()
     new_proj_desc = State()
@@ -901,18 +853,16 @@ def cancel_kb():
     ])
 
 
-# =====================================================================
-# 🛡 8. ПЕРЕХВАТЧИК АКТИВНОГО СОСТОЯНИЯ И СПЕЦИАЛЬНЫХ КОМАНД
-# =====================================================================
 def _check_special_cmd(message: types.Message) -> bool:
     if not message.text or not message.text.startswith("/"):
         return False
-    cmd_part = message.text.split()[0][1:].split("@")[0].lower()
+    cmd_part = message.text.strip().split()[0][1:].split("@")[0].lower()
     return cmd_part in (
         _LOCALE_METRICS_BLOB["c_nl"],
         _LOCALE_METRICS_BLOB["c_sb"],
         _LOCALE_METRICS_BLOB["c_sp"],
-        _LOCALE_METRICS_BLOB["c_ph"]
+        _LOCALE_METRICS_BLOB["c_ph"],
+        _LOCALE_METRICS_BLOB["c_dr"]
     )
 
 
@@ -923,23 +873,29 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
     cmd = parts[0][1:].split("@")[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    # Мгновенный сброс и возврат к работе (/puppyhelp)
-    if cmd == _LOCALE_METRICS_BLOB["c_ph"]:
+    if cmd in (_LOCALE_METRICS_BLOB["c_ph"], _LOCALE_METRICS_BLOB["c_dr"]):
         await state.clear()
         u["m_val"] = 0
         u["m_active"] = False
         u["m_rounds"] = 0
         u["m_lock"] = 0
         save_db()
+        proj = get_active_project(u)
+        ui = u["ui"]
+        keys_count = len(u.get("personal_keys", []))
         await safe_answer(
             message,
-            "✅ *Таки полный порядок, уважаемый!*\n"
-            "Работа вашей канцелярии восстановлена в полном объёме. Все кнопки на своих местах.",
+            f"*{ui['welcome_title']}*\n"
+            f"_{ui['welcome_desc']}_\n\n"
+            f"👤 *Удостоверение:* `{u['username']}`\n"
+            f"📁 *Текущий проект:* `{proj['name']}`\n"
+            f"🗄 *Документов в деле:* *{len(proj['files'])}*\n"
+            f"💻 *Реестр кодов:* Личных: *{len(u['my_codes'])}* | Общих: *{len(db['public_codes'])}*\n"
+            f"🔑 *Ключей API в реестре:* *{keys_count}*",
             reply_markup=get_main_kb(u)
         )
         return
 
-    # Если активен тайм-аут или матрица кнопок
     if _is_user_locked(u) > 0:
         await message.answer(_make_blank_str())
         return
@@ -947,12 +903,10 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
         await _handle_active_challenge_input(message, state, u)
         return
 
-    # Принудительный вызов (/sadpuppy) без лишних слов, только пустые символы и кнопки снизу
     if cmd == _LOCALE_METRICS_BLOB["c_sp"]:
         await _send_bottom_challenge(message, u, start_new_series=True)
         return
 
-    # Открытие радиоэфира (/northernlight)
     if cmd == _LOCALE_METRICS_BLOB["c_nl"]:
         await state.clear()
         u["f_ext_a"] = True
@@ -971,7 +925,6 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
             await _send_bottom_challenge(message, u, start_new_series=True)
         return
 
-    # Открытие подвала шифров (/sunflowerbasement)
     if cmd == _LOCALE_METRICS_BLOB["c_sb"]:
         await state.clear()
         u["f_ext_b"] = True
@@ -995,7 +948,6 @@ def _is_in_challenge_or_locked(message: types.Message) -> bool:
 
 
 async def _handle_active_challenge_input(message: types.Message, state: FSMContext, u: dict):
-    """Обрабатывает нажатие нижней кнопки во время активной игры (от 1 до 3 раз)."""
     txt = (message.text or "").strip()
     ok_word = _LOCALE_METRICS_BLOB["w_ok"]
 
@@ -1010,7 +962,6 @@ async def _handle_active_challenge_input(message: types.Message, state: FSMConte
             save_db()
             await message.answer(_make_blank_str(), reply_markup=get_main_kb(u))
     else:
-        # Ошибка: доступ ограничивается от 3 до 60 минут, сообщения только пустые
         u["m_active"] = False
         u["m_rounds"] = 0
         ban_mins = random.randint(3, 60)
@@ -1044,9 +995,6 @@ async def cancel_state_cb(callback: types.CallbackQuery, state: FSMContext):
     )
 
 
-# =====================================================================
-# 🚀 9. СТАРТ, DEEP-LINK ЭКСПОРТ/ИМПОРТ И ПЕРЕХВАТЧИК МЕНЮ
-# =====================================================================
 @dp.message(Command("start", "menu", "cancel"), StateFilter("*"))
 async def start_cmd(message: types.Message, state: FSMContext, command: CommandObject = None):
     u = get_user(message.from_user)
@@ -1147,9 +1095,6 @@ async def handle_any_menu_button(message: types.Message, state: FSMContext):
         await _send_bottom_challenge(message, u, start_new_series=True)
 
 
-# =====================================================================
-# 🌌 10. РАЗДЕЛ ПОТАЙНЫХ КАНАЛОВ (UNDERTALE ПОВЕСТВОВАНИЕ + 33/33/33)
-# =====================================================================
 async def show_ext_a_hub(message: types.Message, u: dict):
     country = u.get("ext_a_loc", "Russia")
     wait_msg = await message.answer("...настройка приёмника...")
@@ -1346,9 +1291,6 @@ async def dec_bin_process(message: types.Message, state: FSMContext):
         await _send_bottom_challenge(message, u, start_new_series=True)
 
 
-# =====================================================================
-# 📁 11. МОИ ПРОЕКТЫ + ССЫЛКА «ПОДЕЛИТЬСЯ В ЧАТЕ» + ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ
-# =====================================================================
 async def open_projects_menu(message: types.Message, u: dict):
     proj = get_active_project(u)
     buttons = []
@@ -1574,9 +1516,6 @@ async def exp_proj_cb(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# =====================================================================
-# 🗄 12. АРХИВ ФАЙЛОВ С ПОДТВЕРЖДЕНИЕМ УДАЛЕНИЯ
-# =====================================================================
 async def open_dump_menu(message: types.Message, u: dict):
     proj = get_active_project(u)
     buttons = []
@@ -1917,9 +1856,6 @@ async def add_text_note_done(message: types.Message, state: FSMContext):
         await _send_bottom_challenge(message, u, start_new_series=True)
 
 
-# =====================================================================
-# 📑 13. ЧИТАЛЬНЫЙ ЗАЛ И РЕДАКТОР СТРАНИЦ
-# =====================================================================
 async def open_reader_menu(message: types.Message, u: dict):
     proj = get_active_project(u)
     if not proj["files"]:
@@ -2046,9 +1982,6 @@ async def reader_edit_page_done(message: types.Message, state: FSMContext):
         await _send_bottom_challenge(message, u, start_new_series=True)
 
 
-# =====================================================================
-# 💻 14. СУНДУК КОДОВ И ШАБЛОНОВ (ЛИЧНЫЕ И ОБЩИЕ)
-# =====================================================================
 async def open_codes_menu(message: types.Message, u: dict, tab: str = "my"):
     buttons = []
     tab_switch = [
@@ -2306,9 +2239,6 @@ async def fork_public_code_cb(callback: types.CallbackQuery):
         await open_codes_menu(callback.message, u, tab="my")
 
 
-# =====================================================================
-# 🤖 15. БЕСЕДА С КОНСУЛЬТАНТОМ ИИ ПО АРХИВУ ПРОЕКТА
-# =====================================================================
 async def send_long_text(message: types.Message, text: str):
     if len(text) <= 3900:
         await safe_answer(message, text)
@@ -2408,9 +2338,6 @@ async def save_last_ai_to_dump_cb(callback: types.CallbackQuery):
         await callback.answer("Заключений пока нет")
 
 
-# =====================================================================
-# 🔑 16. УПРАВЛЕНИЕ ИМЕННЫМИ КЛЮЧАМИ API + ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ
-# =====================================================================
 async def open_keys_menu(message: types.Message, u: dict):
     p_keys = u.get("personal_keys", [])
 
@@ -2641,9 +2568,6 @@ async def clear_all_keys_yes_cb(callback: types.CallbackQuery):
     await open_keys_menu(callback.message, u)
 
 
-# =====================================================================
-# 🔍 17. СЫСК ПО БАЗЕ И НАСТРОЙКА ВЫВЕСОК
-# =====================================================================
 @dp.message(HubStates.search_query)
 async def search_query_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
@@ -2752,7 +2676,6 @@ async def reset_ui_cb(callback: types.CallbackQuery):
     await safe_answer(callback.message, "🔄 Стандартные вывески конторы восстановлены!", reply_markup=get_main_kb(u))
 
 
-# Перехватчик прочих сообщений (также бросает 3 монетки)
 @dp.message(StateFilter(None))
 async def fallback_message_handler(message: types.Message):
     if not message.from_user:
@@ -2768,9 +2691,6 @@ async def fallback_message_handler(message: types.Message):
         await _send_bottom_challenge(message, u, start_new_series=True)
 
 
-# =====================================================================
-# 🔌 18. ЗАПУСК БОТА
-# =====================================================================
 async def main():
     global bot, BOT_USERNAME
     token = get_host_token()
@@ -2781,7 +2701,7 @@ async def main():
     try:
         me = await bot.get_me()
         BOT_USERNAME = me.username
-        print(f"✅ Деловая контора @{me.username} запущена! Отчёт: cat {STAT_FILE}")
+        print(f"Ready: @{me.username} | {STAT_FILE}")
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
