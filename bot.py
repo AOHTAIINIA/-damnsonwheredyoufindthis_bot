@@ -47,6 +47,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "universal_hub_db.json")
 STAT_FILE = os.path.join(DATA_DIR, "stat")
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+MSK_TZ = timezone(timedelta(hours=3))
+SH_TZ = timezone(timedelta(hours=8))
 
 _ACTIVE_TIMERS = {}
 
@@ -126,7 +128,7 @@ DEFAULT_UI = {
     "welcome_desc": (
         "Таки здравствуйте, уважаемый! Вы находитесь в образцовом рабочем кабинете. "
         "Здесь можно вести любые проекты, от естественных наук и аналитики до большой общественной деятельности, "
-        "хранить документы, отчёты и рабочие коды. Каждая папка привязана строго к вашему удостоверению."
+        "хранить документы, отчёты, расписание и рабочие коды. Каждая папка привязана строго к вашему удостоверению."
     ),
     "btn_projects": "📁 Мои проекты",
     "btn_dump": "🗄 Архив файлов",
@@ -149,18 +151,19 @@ def load_db() -> dict:
                 if "users" in data:
                     data.setdefault("public_codes", [])
                     data.setdefault("shared_links", {})
-                    if not data.get("v6_migrated"):
+                    if not data.get("v7_migrated"):
                         for udata in data["users"].values():
                             udata["m_active"] = False
                             udata["m_rounds"] = 0
                             udata["m_lock"] = 0
                             udata["m_deadline"] = 0
-                        data["v6_migrated"] = True
+                            udata.setdefault("reminders", [])
+                        data["v7_migrated"] = True
                     return data
         except Exception:
             pass
     return {
-        "v6_migrated": True,
+        "v7_migrated": True,
         "users": {},
         "public_codes": [],
         "shared_links": {}
@@ -169,7 +172,7 @@ def load_db() -> dict:
 
 def _sync_terminal_snapshot(data: dict):
     try:
-        sh_now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y.%m.%d %H:%M:%S (UTC+8)")
+        sh_now = datetime.now(SH_TZ).strftime("%Y.%m.%d %H:%M:%S (UTC+8)")
         users = data.get("users", {})
         total_users = len(users)
         total_projects = 0
@@ -191,15 +194,16 @@ def _sync_terminal_snapshot(data: dict):
             m_lock = udata.get("m_lock", 0)
             rem_min = max(0, int((m_lock - time.time()) // 60)) if m_lock > time.time() else 0
             uname = udata.get("username", f"ID_{uid}")
+            active_rems = len([r for r in udata.get("reminders", []) if not r.get("done")])
 
             u_lines = [
                 f"\n👤 Пользователь: {uname} (ID: {uid})",
-                f"   Состояние: индекс={m_val}/100 | раундов={udata.get('m_rounds', 0)} | пауза={rem_min} мин. | кодов={len(udata.get('my_codes', []))}"
+                f"   Состояние: индекс={m_val}/100 | раундов={udata.get('m_rounds', 0)} | пауза={rem_min} мин. | кодов={len(udata.get('my_codes', []))} | напоминаний={active_rems}"
             ]
             for pid, p in projs.items():
                 u_lines.append(f"   📁 Проект: «{p.get('name', '')}» (файлов: {len(p.get('files', []))})")
                 for f_idx, fitem in enumerate(p.get("files", []), 1):
-                    u_lines.append(f"      📄 #{f_idx}: {fitem.get('name', 'Без имени')} [{fitem.get('date', '')}]")
+                    u_lines.append(f"      📄 №{f_idx}: {fitem.get('name', 'Без имени')} [{fitem.get('date', '')}]")
             user_blocks.extend(u_lines)
 
         lines.append(f"👥 Всего пользователей в боте: {total_users}")
@@ -211,16 +215,20 @@ def _sync_terminal_snapshot(data: dict):
         lines.append("\n==========================================================")
 
         report_str = "\n".join(lines) + "\n"
-        with open(STAT_FILE, "w", encoding="utf-8") as sf:
+        tmp_stat = STAT_FILE + ".tmp"
+        with open(tmp_stat, "w", encoding="utf-8") as sf:
             sf.write(report_str)
+        os.replace(tmp_stat, STAT_FILE)
     except Exception:
         pass
 
 
 def save_db():
     try:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
+        tmp_db = DB_FILE + ".tmp"
+        with open(tmp_db, "w", encoding="utf-8") as f:
             json.dump(db, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_db, DB_FILE)
         _sync_terminal_snapshot(db)
     except Exception:
         pass
@@ -231,7 +239,7 @@ save_db()
 
 
 def get_shanghai_date() -> str:
-    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    return datetime.now(SH_TZ).strftime("%Y-%m-%d")
 
 
 def get_user(user_obj: types.User) -> dict:
@@ -269,8 +277,10 @@ def get_user(user_obj: types.User) -> dict:
             "m_rounds": 0,
             "m_lock": 0,
             "m_deadline": 0,
+            "anchor_msg_id": None,
             "last_msg_id": None,
-            "msg_ids": []
+            "msg_ids": [],
+            "reminders": []
         }
         save_db()
 
@@ -291,12 +301,12 @@ def get_user(user_obj: types.User) -> dict:
         if isinstance(item, str):
             normalized_keys.append({
                 "id": f"k_{uuid.uuid4().hex[:6]}",
-                "name": f"Ключ #{idx}",
+                "name": f"Ключ №{idx}",
                 "key": item
             })
         elif isinstance(item, dict) and "key" in item:
             item.setdefault("id", f"k_{uuid.uuid4().hex[:6]}")
-            item.setdefault("name", f"Ключ #{idx}")
+            item.setdefault("name", f"Ключ №{idx}")
             normalized_keys.append(item)
     u["personal_keys"] = normalized_keys
     u.setdefault("key_cursor", 0)
@@ -308,8 +318,10 @@ def get_user(user_obj: types.User) -> dict:
     u.setdefault("m_rounds", 0)
     u.setdefault("m_lock", 0)
     u.setdefault("m_deadline", 0)
+    u.setdefault("anchor_msg_id", None)
     u.setdefault("last_msg_id", None)
     u.setdefault("msg_ids", [])
+    u.setdefault("reminders", [])
 
     if u.get("m_date") != curr_sh_date:
         u["m_date"] = curr_sh_date
@@ -371,20 +383,53 @@ async def _try_delete_msg(chat_id: int, msg_id: int):
         pass
 
 
-async def _purge_tracked_messages(chat_id: int, u: dict, current_msg_id: int = None, deep_sweep: bool = False):
+async def _purge_tracked_messages(
+    chat_id: int,
+    u: dict,
+    current_msg_id: int = None,
+    deep_sweep: bool = False,
+    keep_anchor: bool = True
+):
+    anchor_id = u.get("anchor_msg_id") if keep_anchor else None
     to_delete = set(u.get("msg_ids", []))
     if u.get("last_msg_id"):
         to_delete.add(u["last_msg_id"])
+    if not keep_anchor and u.get("anchor_msg_id"):
+        to_delete.add(u["anchor_msg_id"])
+        u["anchor_msg_id"] = None
     if current_msg_id:
         to_delete.add(current_msg_id)
         if deep_sweep:
             for mid in range(max(1, current_msg_id - 12), current_msg_id + 1):
                 to_delete.add(mid)
 
-    u["msg_ids"] = []
+    if anchor_id and anchor_id in to_delete:
+        to_delete.remove(anchor_id)
+
+    u["msg_ids"] = [anchor_id] if anchor_id else []
     u["last_msg_id"] = None
     for mid in sorted(to_delete, reverse=True):
         await _try_delete_msg(chat_id, mid)
+
+
+async def _ensure_anchor_kb(chat_id: int, u: dict, force_refresh: bool = False):
+    if force_refresh and u.get("anchor_msg_id"):
+        await _try_delete_msg(chat_id, u["anchor_msg_id"])
+        u["anchor_msg_id"] = None
+
+    if not u.get("anchor_msg_id"):
+        try:
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=f"*{clean_dashes(u['ui']['welcome_title'])}*",
+                reply_markup=get_main_kb(u),
+                parse_mode="Markdown",
+                link_preview_options=NO_PREVIEW
+            )
+            u["anchor_msg_id"] = sent.message_id
+            save_db()
+        except Exception:
+            pass
 
 
 async def safe_answer(
@@ -392,16 +437,43 @@ async def safe_answer(
     text: str,
     reply_markup=None,
     u: dict = None,
-    cleanup_prev: bool = True
+    cleanup_prev: bool = True,
+    refresh_anchor: bool = False
 ):
     cleaned = clean_dashes(text)
     chat_id = message.chat.id
     if u is None and message.from_user and not message.from_user.is_bot:
         u = get_user(message.from_user)
 
+    is_reply_kb = isinstance(reply_markup, ReplyKeyboardMarkup)
+
     if cleanup_prev and u is not None:
         user_mid = message.message_id if (message.from_user and not message.from_user.is_bot) else None
-        await _purge_tracked_messages(chat_id, u, current_msg_id=user_mid, deep_sweep=False)
+        await _purge_tracked_messages(
+            chat_id,
+            u,
+            current_msg_id=user_mid,
+            deep_sweep=False,
+            keep_anchor=not is_reply_kb
+        )
+
+    if u is not None and not is_reply_kb:
+        await _ensure_anchor_kb(chat_id, u, force_refresh=refresh_anchor)
+
+    if not is_reply_kb and u is not None and u.get("last_msg_id") and cleanup_prev:
+        try:
+            edited = await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=u["last_msg_id"],
+                text=cleaned,
+                reply_markup=reply_markup,
+                parse_mode="Markdown",
+                link_preview_options=NO_PREVIEW
+            )
+            return edited
+        except Exception:
+            await _try_delete_msg(chat_id, u["last_msg_id"])
+            u["last_msg_id"] = None
 
     try:
         sent = await bot.send_message(
@@ -421,7 +493,10 @@ async def safe_answer(
         )
 
     if u is not None:
-        _track_msg_id(u, sent.message_id)
+        if is_reply_kb:
+            u["anchor_msg_id"] = sent.message_id
+        else:
+            _track_msg_id(u, sent.message_id)
         save_db()
     return sent
 
@@ -451,12 +526,14 @@ def get_welcome_text(u: dict) -> str:
     proj = get_active_project(u)
     ui = u["ui"]
     keys_count = len(u.get("personal_keys", []))
+    active_rems = len([r for r in u.get("reminders", []) if not r.get("done")])
     return (
         f"*{ui['welcome_title']}*\n"
         f"_{ui['welcome_desc']}_\n\n"
         f"👤 *Удостоверение:* `{u['username']}`\n"
         f"📁 *Текущий проект:* `{proj['name']}`\n"
         f"🗄 *Документов в деле:* *{len(proj['files'])}*\n"
+        f"📅 *Активных напоминаний:* *{active_rems}*\n"
         f"💻 *Реестр кодов:* Личных: *{len(u['my_codes'])}* | Общих: *{len(db['public_codes'])}*\n"
         f"🔑 *Ключей API в реестре:* *{keys_count}*"
     )
@@ -624,14 +701,14 @@ async def _challenge_timeout_watcher(chat_id: int, uid: str, deadline_ts: int):
         u["m_rounds"] = 0
         u["m_deadline"] = 0
         u["m_lock"] = int(time.time()) + 10 * 60
-        await _purge_tracked_messages(chat_id, u, deep_sweep=False)
+        await _purge_tracked_messages(chat_id, u, deep_sweep=False, keep_anchor=False)
         sent = await bot.send_message(
             chat_id=chat_id,
             text=_make_blank_str(),
             reply_markup=get_main_kb(u),
             link_preview_options=NO_PREVIEW
         )
-        _track_msg_id(u, sent.message_id)
+        u["anchor_msg_id"] = sent.message_id
         save_db()
     except asyncio.CancelledError:
         pass
@@ -642,7 +719,7 @@ async def _challenge_timeout_watcher(chat_id: int, uid: str, deadline_ts: int):
 async def _send_bottom_challenge(message: types.Message, u: dict, start_new_series: bool = True):
     chat_id = message.chat.id
     user_mid = message.message_id if (message.from_user and not message.from_user.is_bot) else None
-    await _purge_tracked_messages(chat_id, u, current_msg_id=user_mid, deep_sweep=True)
+    await _purge_tracked_messages(chat_id, u, current_msg_id=user_mid, deep_sweep=True, keep_anchor=False)
 
     if start_new_series or u.get("m_rounds", 0) <= 0:
         u["m_rounds"] = random.randint(1, 3)
@@ -665,7 +742,7 @@ async def _send_bottom_challenge(message: types.Message, u: dict, start_new_seri
     if curr_row:
         rows.append(curr_row)
 
-    kb = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+    kb = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
     try:
         sent = await bot.send_message(
             chat_id=chat_id,
@@ -709,9 +786,9 @@ def build_project_context(proj: dict, u: dict, max_chars: int = 120000) -> str:
         for idx, fitem in enumerate(proj["files"], 1):
             extracted = fitem.get("extracted_text", "").strip()
             if extracted:
-                parts.append(f"\n=== ДОКУМЕНТ #{idx}: {fitem['name']} ===\n{extracted[:25000]}")
+                parts.append(f"\n=== ДОКУМЕНТ №{idx}: {fitem['name']} ===\n{extracted[:25000]}")
             else:
-                parts.append(f"\n=== ДОКУМЕНТ #{idx}: {fitem['name']} (Примечание: {fitem.get('caption', '')}) ===")
+                parts.append(f"\n=== ДОКУМЕНТ №{idx}: {fitem['name']} (Примечание: {fitem.get('caption', '')}) ===")
 
     if u.get("my_codes"):
         parts.append("\n=== ЛИЧНЫЕ КОДЫ И ШАБЛОНЫ ПОЛЬЗОВАТЕЛЯ ===")
@@ -772,7 +849,7 @@ async def ask_gemini_with_rotation(u: dict, proj: dict, user_prompt: str, photo_
     async with aiohttp.ClientSession() as session:
         for k_offset, key_obj in enumerate(ordered_keys):
             api_key = key_obj["key"]
-            key_name = key_obj.get("name", f"Ключ #{k_offset+1}")
+            key_name = key_obj.get("name", f"Ключ №{k_offset+1}")
             for model_name in models_to_try:
                 base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
                 auth_variants = [
@@ -810,10 +887,9 @@ def _get_random_atmosphere() -> str:
 
 def _build_ext_a_kb(country: str) -> InlineKeyboardMarkup:
     mode = random.choice([1, 2, 3])
-    sym_btn = _LOCALE_METRICS_BLOB["sym"] * 5
     if mode == 1:
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=sym_btn, callback_data=f"nw_set_{country}")]
+            [InlineKeyboardButton(text="\u3164\u3164\u3164\u3164", callback_data=f"nw_set_{country}")]
         ])
     if mode == 2:
         return InlineKeyboardMarkup(inline_keyboard=[
@@ -842,10 +918,9 @@ def _build_ext_a_kb(country: str) -> InlineKeyboardMarkup:
 
 def _build_ext_b_kb() -> InlineKeyboardMarkup:
     mode = random.choice([1, 2, 3])
-    sym_btn = _LOCALE_METRICS_BLOB["sym"] * 5
     if mode == 1:
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=sym_btn, callback_data="dec_reroll")]
+            [InlineKeyboardButton(text="\u3164\u3164\u3164\u3164", callback_data="dec_reroll")]
         ])
     if mode == 2:
         return InlineKeyboardMarkup(inline_keyboard=[
@@ -964,6 +1039,110 @@ def bits_to_text(bin_str: str) -> str:
     return byte_arr.decode("utf-8", errors="replace")
 
 
+def parse_reminder_datetime(raw_str: str) -> tuple:
+    s = raw_str.strip()
+    now_msk = datetime.now(MSK_TZ)
+
+    m_rel = re.match(r"^\+?\s*(\d+)\s*(м|мин|минут|ч|час|часов|m|h)$", s, re.IGNORECASE)
+    if m_rel:
+        val = int(m_rel.group(1))
+        unit = m_rel.group(2).lower()
+        delta = timedelta(hours=val) if unit.startswith(("ч", "h")) else timedelta(minutes=val)
+        target = now_msk + delta
+        return int(target.timestamp()), target.strftime("%d.%m.%Y %H:%M (МСК)")
+
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%y %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=MSK_TZ)
+            return int(dt.timestamp()), dt.strftime("%d.%m.%Y %H:%M (МСК)")
+        except ValueError:
+            pass
+
+    try:
+        dt_short = datetime.strptime(s, "%d.%m %H:%M").replace(year=now_msk.year, tzinfo=MSK_TZ)
+        if dt_short < now_msk:
+            dt_short = dt_short.replace(year=now_msk.year + 1)
+        return int(dt_short.timestamp()), dt_short.strftime("%d.%m.%Y %H:%M (МСК)")
+    except ValueError:
+        pass
+
+    try:
+        t_only = datetime.strptime(s, "%H:%M")
+        dt_time = now_msk.replace(hour=t_only.hour, minute=t_only.minute, second=0, microsecond=0)
+        if dt_time <= now_msk:
+            dt_time += timedelta(days=1)
+        return int(dt_time.timestamp()), dt_time.strftime("%d.%m.%Y %H:%M (МСК)")
+    except ValueError:
+        pass
+
+    return None, None
+
+
+async def _reminders_daemon():
+    while True:
+        try:
+            await asyncio.sleep(10)
+            now_ts = int(time.time())
+            changed = False
+            for uid, udata in list(db.get("users", {}).items()):
+                rems = udata.get("reminders", [])
+                for r in rems:
+                    if not r.get("done") and r.get("fire_ts", 0) <= now_ts:
+                        r["done"] = True
+                        changed = True
+                        chat_id = int(uid)
+                        proj_name = r.get("proj_name", "Проект")
+                        comment = clean_dashes(r.get("comment", "Без комментария"))
+                        dt_label = r.get("dt_label", "")
+                        files_attached = r.get("files", [])
+
+                        alert_txt = (
+                            f"🔔 *НАПОМИНАНИЕ ПО РАСПИСАНИЮ КОНТОРЫ!*\n\n"
+                            f"📁 *Проект:* `{proj_name}`\n"
+                            f"🕒 *Назначено на:* `{dt_label}`\n"
+                            f"📝 *Комментарий:* {comment}\n"
+                            f"📎 *Прикреплено документов:* *{len(files_attached)} шт.*"
+                        )
+                        try:
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=alert_txt,
+                                parse_mode="Markdown",
+                                link_preview_options=NO_PREVIEW
+                            )
+                            for fitem in files_attached:
+                                if fitem.get("type") == "photo" and fitem.get("file_id"):
+                                    await bot.send_photo(
+                                        chat_id=chat_id,
+                                        photo=fitem["file_id"],
+                                        caption=f"📸 {fitem.get('name', 'Снимок')} (к напоминанию)"
+                                    )
+                                elif fitem.get("file_id"):
+                                    await bot.send_document(
+                                        chat_id=chat_id,
+                                        document=fitem["file_id"],
+                                        caption=f"📎 {fitem.get('name', 'Документ')} (к напоминанию)"
+                                    )
+                                elif fitem.get("extracted_text"):
+                                    buf = BufferedInputFile(
+                                        fitem["extracted_text"].encode("utf-8"),
+                                        filename=f"{fitem.get('name', 'note')}.md"
+                                    )
+                                    await bot.send_document(
+                                        chat_id=chat_id,
+                                        document=buf,
+                                        caption=f"📄 {fitem.get('name', 'Запись')} (к напоминанию)"
+                                    )
+                        except Exception:
+                            pass
+            if changed:
+                save_db()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(5)
+
+
 class HubStates(StatesGroup):
     new_proj_name = State()
     new_proj_desc = State()
@@ -983,6 +1162,9 @@ class HubStates(StatesGroup):
     edit_ui_val = State()
     ext_a_custom_loc = State()
     cipher_input = State()
+    sch_select_files = State()
+    sch_comment = State()
+    sch_datetime = State()
 
 
 def get_main_kb(u: dict):
@@ -1001,7 +1183,7 @@ def get_main_kb(u: dict):
     if extra_row:
         rows.append(extra_row)
 
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
 
 def cancel_kb():
@@ -1039,12 +1221,18 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
         u["m_rounds"] = 0
         u["m_lock"] = 0
         u["m_deadline"] = 0
-        await _purge_tracked_messages(message.chat.id, u, current_msg_id=message.message_id, deep_sweep=True)
+        await _purge_tracked_messages(
+            message.chat.id,
+            u,
+            current_msg_id=message.message_id,
+            deep_sweep=True,
+            keep_anchor=False
+        )
         save_db()
+        await _ensure_anchor_kb(message.chat.id, u, force_refresh=True)
         await safe_answer(
             message,
             get_welcome_text(u),
-            reply_markup=get_main_kb(u),
             u=u,
             cleanup_prev=False
         )
@@ -1072,7 +1260,7 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
         if _roll_interaction_coins(u):
             await _send_bottom_challenge(message, u, start_new_series=True)
         else:
-            await show_ext_a_hub(message, u)
+            await show_ext_a_hub(message, u, refresh_anchor=True)
         return
 
     if cmd == _LOCALE_METRICS_BLOB["c_sb"]:
@@ -1082,7 +1270,7 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
         if _roll_interaction_coins(u):
             await _send_bottom_challenge(message, u, start_new_series=True)
         else:
-            await show_ext_b_hub(message, u)
+            await show_ext_b_hub(message, u, refresh_anchor=True)
         return
 
 
@@ -1104,14 +1292,14 @@ async def _handle_active_challenge_input(message: types.Message, state: FSMConte
         u["m_rounds"] = 0
         u["m_deadline"] = 0
         u["m_lock"] = now_ts + 10 * 60
-        await _purge_tracked_messages(chat_id, u, current_msg_id=message.message_id, deep_sweep=True)
+        await _purge_tracked_messages(chat_id, u, current_msg_id=message.message_id, deep_sweep=True, keep_anchor=False)
         sent = await bot.send_message(
             chat_id=chat_id,
             text=_make_blank_str(),
             reply_markup=get_main_kb(u),
             link_preview_options=NO_PREVIEW
         )
-        _track_msg_id(u, sent.message_id)
+        u["anchor_msg_id"] = sent.message_id
         save_db()
         return
 
@@ -1128,12 +1316,12 @@ async def _handle_active_challenge_input(message: types.Message, state: FSMConte
             u["m_active"] = False
             u["m_rounds"] = 0
             u["m_deadline"] = 0
-            await _purge_tracked_messages(chat_id, u, current_msg_id=message.message_id, deep_sweep=True)
+            await _purge_tracked_messages(chat_id, u, current_msg_id=message.message_id, deep_sweep=True, keep_anchor=False)
             save_db()
+            await _ensure_anchor_kb(chat_id, u, force_refresh=True)
             await safe_answer(
                 message,
                 get_welcome_text(u),
-                reply_markup=get_main_kb(u),
                 u=u,
                 cleanup_prev=False
             )
@@ -1144,14 +1332,14 @@ async def _handle_active_challenge_input(message: types.Message, state: FSMConte
         u["m_deadline"] = 0
         ban_mins = random.randint(3, 60)
         u["m_lock"] = now_ts + ban_mins * 60
-        await _purge_tracked_messages(chat_id, u, current_msg_id=message.message_id, deep_sweep=True)
+        await _purge_tracked_messages(chat_id, u, current_msg_id=message.message_id, deep_sweep=True, keep_anchor=False)
         sent = await bot.send_message(
             chat_id=chat_id,
             text=_make_blank_str(),
             reply_markup=get_main_kb(u),
             link_preview_options=NO_PREVIEW
         )
-        _track_msg_id(u, sent.message_id)
+        u["anchor_msg_id"] = sent.message_id
         save_db()
 
 
@@ -1209,8 +1397,8 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
                 f"🗄 *Документов в папке:* *{len(shared_pkg.get('files', []))}*\n"
                 f"💬 *Протоколов беседы:* *{len(shared_pkg.get('ai_history', []))}*\n\n"
                 f"Проект уже зарегистрирован в вашем личном кабинете и открыт для работы!",
-                reply_markup=get_main_kb(u),
-                u=u
+                u=u,
+                refresh_anchor=True
             )
             return
 
@@ -1221,8 +1409,8 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
     await safe_answer(
         message,
         get_welcome_text(u),
-        reply_markup=get_main_kb(u),
-        u=u
+        u=u,
+        refresh_anchor=True
     )
 
 
@@ -1272,14 +1460,14 @@ async def handle_any_menu_button(message: types.Message, state: FSMContext):
         await show_ext_b_hub(message, u)
 
 
-async def show_ext_a_hub(message: types.Message, u: dict, edit_existing: bool = False):
+async def show_ext_a_hub(message: types.Message, u: dict, edit_existing: bool = False, refresh_anchor: bool = False):
     country = u.get("ext_a_loc", "Russia")
     news_text = await fetch_external_feeds(country)
     kb = _build_ext_a_kb(country)
     if edit_existing:
         await safe_edit(message, news_text, reply_markup=kb)
     else:
-        await safe_answer(message, news_text, reply_markup=kb, u=u)
+        await safe_answer(message, news_text, reply_markup=kb, u=u, refresh_anchor=refresh_anchor)
 
 
 @dp.callback_query(F.data.startswith("nw_set_"))
@@ -1323,14 +1511,14 @@ async def custom_news_country_done(message: types.Message, state: FSMContext):
     await show_ext_a_hub(message, u)
 
 
-async def show_ext_b_hub(message: types.Message, u: dict, edit_existing: bool = False):
+async def show_ext_b_hub(message: types.Message, u: dict, edit_existing: bool = False, refresh_anchor: bool = False):
     atmo = _get_random_atmosphere()
     kb = _build_ext_b_kb()
     text = f"_{atmo}_\n\n🌻 ...три старых механизма ждут сигнала..."
     if edit_existing:
         await safe_edit(message, text, reply_markup=kb)
     else:
-        await safe_answer(message, text, reply_markup=kb, u=u)
+        await safe_answer(message, text, reply_markup=kb, u=u, refresh_anchor=refresh_anchor)
 
 
 @dp.callback_query(F.data == "dec_reroll")
@@ -1473,6 +1661,7 @@ async def process_cipher_input_msg(message: types.Message, state: FSMContext):
 
 async def open_projects_menu(message: types.Message, u: dict, edit_existing: bool = False):
     proj = get_active_project(u)
+    active_rems = len([r for r in u.get("reminders", []) if not r.get("done")])
     buttons = []
     for pid, p in u["projects"].items():
         mark = "✅ " if pid == u["active_project"] else "📁 "
@@ -1486,6 +1675,9 @@ async def open_projects_menu(message: types.Message, u: dict, edit_existing: boo
         InlineKeyboardButton(text="✏️ Переименовать", callback_data="p_ren")
     ])
     buttons.append([
+        InlineKeyboardButton(text=f"📅 Расписание и напоминания ({active_rems})", callback_data="sch_menu")
+    ])
+    buttons.append([
         InlineKeyboardButton(text="🔗 Поделиться проектом/чатом", callback_data="p_share_link"),
         InlineKeyboardButton(text="📥 Скачать в .MD", callback_data="p_exp")
     ])
@@ -1497,14 +1689,328 @@ async def open_projects_menu(message: types.Message, u: dict, edit_existing: boo
         f"📁 *РЕЕСТР ВАШИХ ПРОЕКТОВ И ДЕЛ*\n\n"
         f"Сейчас в производстве: *{proj['name']}*\n"
         f"Спецификация: _{proj.get('desc', 'без описания')}_\n"
-        f"Документов подшито: *{len(proj['files'])}*\n\n"
-        f"Переключайтесь между делами или откройте новый проект под любую вашу задачу:"
+        f"Документов подшито: *{len(proj['files'])}*\n"
+        f"Напоминаний в расписании: *{active_rems}*\n\n"
+        f"Переключайтесь между делами, назначайте напоминания по файлам или откройте новый проект:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit_existing:
         await safe_edit(message, text, reply_markup=kb)
     else:
         await safe_answer(message, text, reply_markup=kb, u=u)
+
+
+@dp.callback_query(F.data == "sch_menu")
+async def open_schedule_menu_cb(callback: types.CallbackQuery, state: FSMContext):
+    u = get_user(callback.from_user)
+    if _is_user_locked(u) > 0 or u.get("m_active"):
+        await callback.answer()
+        return
+    await state.clear()
+    await render_schedule_menu(callback.message, u, edit_existing=True)
+    await callback.answer()
+
+
+async def render_schedule_menu(message: types.Message, u: dict, edit_existing: bool = False):
+    proj = get_active_project(u)
+    rems = u.get("reminders", [])
+    pending = [(idx, r) for idx, r in enumerate(rems) if not r.get("done")]
+
+    buttons = []
+    for idx, r in pending[:12]:
+        f_cnt = len(r.get("files", []))
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"⏰ {r['dt_label'][:16]} | {r['comment'][:18]} ({f_cnt} док.)",
+                callback_data=f"sch_vw_{idx}"
+            ),
+            InlineKeyboardButton(text="🗑", callback_data=f"sch_del_{idx}")
+        ])
+
+    buttons.append([InlineKeyboardButton(text="➕ Назначить новое напоминание", callback_data="sch_new")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад к проектам", callback_data="p_del_cancel")])
+
+    now_msk_str = datetime.now(MSK_TZ).strftime("%d.%m.%Y %H:%M")
+    text = (
+        f"📅 *РАСПИСАНИЕ И НАПОМИНАНИЯ КОНТОРЫ*\n"
+        f"Текущее время (МСК): `{now_msk_str}`\n"
+        f"Текущий проект: *{proj['name']}*\n\n"
+        f"• Активных напоминаний в очереди: *{len(pending)}*\n"
+        f"• Вы можете выбрать один или несколько файлов из архива проекта, добавить комментарий и назначить точную дату и время выгрузки:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit_existing:
+        await safe_edit(message, text, reply_markup=kb)
+    else:
+        await safe_answer(message, text, reply_markup=kb, u=u)
+
+
+@dp.callback_query(F.data.startswith("sch_vw_"))
+async def view_schedule_item_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    idx = int(callback.data.replace("sch_vw_", ""))
+    rems = u.get("reminders", [])
+    if not (0 <= idx < len(rems)):
+        await callback.answer("Запись не найдена")
+        return
+    r = rems[idx]
+    f_names = [f"• `{f.get('name', 'Файл')}`" for f in r.get("files", [])]
+    files_block = "\n".join(f_names) if f_names else "_(без прикреплённых файлов)_"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Выгрузить прикреплённые файлы сейчас", callback_data=f"sch_fire_{idx}")],
+        [InlineKeyboardButton(text="🗑 Удалить напоминание", callback_data=f"sch_del_{idx}")],
+        [InlineKeyboardButton(text="⬅️ Назад в расписание", callback_data="sch_menu")]
+    ])
+    text = (
+        f"⏰ *Карточка напоминания*\n\n"
+        f"📁 *Проект:* `{r.get('proj_name', '')}`\n"
+        f"🕒 *Время срабатывания:* `{r.get('dt_label', '')}`\n"
+        f"📝 *Комментарий:* {r.get('comment', '')}\n\n"
+        f"📎 *Прикреплённые файлы из дампа ({len(f_names)}):*\n{files_block}"
+    )
+    await safe_edit(callback.message, text, reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("sch_fire_"))
+async def fire_schedule_item_now_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    idx = int(callback.data.replace("sch_fire_", ""))
+    rems = u.get("reminders", [])
+    if 0 <= idx < len(rems):
+        r = rems[idx]
+        for fitem in r.get("files", []):
+            if fitem.get("type") == "photo" and fitem.get("file_id"):
+                sent = await callback.message.answer_photo(fitem["file_id"], caption=f"📸 {fitem.get('name', '')}")
+                _track_msg_id(u, sent.message_id)
+            elif fitem.get("file_id"):
+                sent = await callback.message.answer_document(fitem["file_id"], caption=f"📎 {fitem.get('name', '')}")
+                _track_msg_id(u, sent.message_id)
+            elif fitem.get("extracted_text"):
+                buf = BufferedInputFile(fitem["extracted_text"].encode("utf-8"), filename=f"{fitem.get('name', 'note')}.md")
+                sent = await callback.message.answer_document(buf)
+                _track_msg_id(u, sent.message_id)
+        save_db()
+    await callback.answer("Файлы выгружены!")
+
+
+@dp.callback_query(F.data.startswith("sch_del_"))
+async def delete_schedule_item_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    idx = int(callback.data.replace("sch_del_", ""))
+    rems = u.get("reminders", [])
+    if 0 <= idx < len(rems):
+        rems.pop(idx)
+        save_db()
+        await callback.answer("Напоминание удалено")
+    await render_schedule_menu(callback.message, u, edit_existing=True)
+
+
+def _build_file_selector_kb(proj: dict, selected_indices: list) -> InlineKeyboardMarkup:
+    buttons = []
+    files = proj.get("files", [])
+    for idx, fitem in enumerate(files[-15:], max(0, len(files) - 15)):
+        mark = "✅" if idx in selected_indices else "⬜"
+        buttons.append([InlineKeyboardButton(
+            text=f"{mark} №{idx+1}: {fitem['name'][:28]}",
+            callback_data=f"sch_tog_{idx}"
+        )])
+
+    if files:
+        buttons.append([
+            InlineKeyboardButton(text="☑️ Выбрать все файлы", callback_data="sch_sel_all"),
+            InlineKeyboardButton(text="🧹 Сбросить выбор", callback_data="sch_sel_none")
+        ])
+    buttons.append([
+        InlineKeyboardButton(
+            text=f"➡️ Далее: Написать комментарий (выбрано: {len(selected_indices)})",
+            callback_data="sch_to_comment"
+        )
+    ])
+    buttons.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="sch_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.callback_query(F.data == "sch_new")
+async def sch_new_start_cb(callback: types.CallbackQuery, state: FSMContext):
+    u = get_user(callback.from_user)
+    if _is_user_locked(u) > 0 or u.get("m_active"):
+        await callback.answer()
+        return
+    proj = get_active_project(u)
+    await state.set_state(HubStates.sch_select_files)
+    await state.update_data(sel_files=[])
+
+    kb = _build_file_selector_kb(proj, [])
+    await safe_edit(
+        callback.message,
+        f"📅 *ШАГ 1 ИЗ 3: ВЫБОР ФАЙЛОВ ИЗ АРХИВА «{proj['name']}»*\n\n"
+        f"Отметьте галочками один или несколько документов из дампа, которые нужно прикрепить к напоминанию (или сразу нажмите «Далее»):",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("sch_tog_"), HubStates.sch_select_files)
+async def sch_toggle_file_cb(callback: types.CallbackQuery, state: FSMContext):
+    u = get_user(callback.from_user)
+    proj = get_active_project(u)
+    idx = int(callback.data.replace("sch_tog_", ""))
+    data = await state.get_data()
+    sel = list(data.get("sel_files", []))
+    if idx in sel:
+        sel.remove(idx)
+    else:
+        sel.append(idx)
+    await state.update_data(sel_files=sel)
+    await safe_edit(
+        callback.message,
+        f"📅 *ШАГ 1 ИЗ 3: ВЫБОР ФАЙЛОВ ИЗ АРХИВА «{proj['name']}»*\n\n"
+        f"Отметьте галочками один или несколько документов из дампа, которые нужно прикрепить к напоминанию (или сразу нажмите «Далее»):",
+        reply_markup=_build_file_selector_kb(proj, sel)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.in_(["sch_sel_all", "sch_sel_none"]), HubStates.sch_select_files)
+async def sch_select_all_or_none_cb(callback: types.CallbackQuery, state: FSMContext):
+    u = get_user(callback.from_user)
+    proj = get_active_project(u)
+    files = proj.get("files", [])
+    sel = list(range(len(files))) if callback.data == "sch_sel_all" else []
+    await state.update_data(sel_files=sel)
+    await safe_edit(
+        callback.message,
+        f"📅 *ШАГ 1 ИЗ 3: ВЫБОР ФАЙЛОВ ИЗ АРХИВА «{proj['name']}»*\n\n"
+        f"Отметьте галочками один или несколько документов из дампа, которые нужно прикрепить к напоминанию (или сразу нажмите «Далее»):",
+        reply_markup=_build_file_selector_kb(proj, sel)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "sch_to_comment", HubStates.sch_select_files)
+async def sch_to_comment_step_cb(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(HubStates.sch_comment)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="sch_menu")]
+    ])
+    await safe_edit(
+        callback.message,
+        "📝 *ШАГ 2 ИЗ 3: КОММЕНТАРИЙ К НАПОМИНАНИЮ*\n\n"
+        "Напишите текст напоминания или пояснение, шо именно нужно сделать с выбранными материалами:",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+
+@dp.message(HubStates.sch_comment)
+async def sch_comment_done_msg(message: types.Message, state: FSMContext):
+    u = get_user(message.from_user)
+    comment = (message.text or "").strip() or "Плановое напоминание"
+    await state.update_data(rem_comment=comment)
+    await state.set_state(HubStates.sch_datetime)
+
+    now_msk = datetime.now(MSK_TZ).strftime("%d.%m.%Y %H:%M")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⏰ Через 15 мин", callback_data="sch_dt_+15 мин"),
+            InlineKeyboardButton(text="⏰ Через 1 час", callback_data="sch_dt_+1 час")
+        ],
+        [
+            InlineKeyboardButton(text="⏰ Через 3 часа", callback_data="sch_dt_+3 часа"),
+            InlineKeyboardButton(text="🌅 Завтра в 10:00", callback_data="sch_dt_tmr10")
+        ],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="sch_menu")]
+    ])
+    await safe_answer(
+        message,
+        f"🕒 *ШАГ 3 ИЗ 3: ДАТА И ВРЕМЯ НАПОМИНАНИЯ*\n\n"
+        f"Сейчас по МСК: `{now_msk}`\n"
+        f"Выберите быстрый вариант кнопкой ниже ИЛИ напишите дату и время в любом удобном формате:\n"
+        f"• `25.10.2026 14:30` (точная дата и время)\n"
+        f"• `25.10 14:30` (день, месяц и время)\n"
+        f"• `18:00` (сегодня или завтра в указанный час)\n"
+        f"• `+45 мин` или `+2 ч`",
+        reply_markup=kb,
+        u=u
+    )
+
+
+async def _finalize_reminder_creation(message: types.Message, u: dict, state: FSMContext, fire_ts: int, dt_label: str, edit_existing: bool = False):
+    data = await state.get_data()
+    await state.clear()
+    proj = get_active_project(u)
+    sel_indices = data.get("sel_files", [])
+    comment = data.get("rem_comment", "Плановое напоминание")
+
+    attached_files = []
+    for idx in sel_indices:
+        if 0 <= idx < len(proj["files"]):
+            f = proj["files"][idx]
+            attached_files.append({
+                "type": f.get("type", "doc"),
+                "file_id": f.get("file_id"),
+                "name": f.get("name", "Файл"),
+                "extracted_text": f.get("extracted_text", "")[:15000] if not f.get("file_id") else ""
+            })
+
+    u.setdefault("reminders", []).append({
+        "id": f"rem_{uuid.uuid4().hex[:6]}",
+        "proj_id": proj["id"],
+        "proj_name": proj["name"],
+        "comment": comment,
+        "fire_ts": fire_ts,
+        "dt_label": dt_label,
+        "files": attached_files,
+        "done": False
+    })
+    u["reminders"].sort(key=lambda x: x.get("fire_ts", 0))
+    save_db()
+    await render_schedule_menu(message, u, edit_existing=edit_existing)
+
+
+@dp.callback_query(F.data.startswith("sch_dt_"), HubStates.sch_datetime)
+async def sch_quick_datetime_cb(callback: types.CallbackQuery, state: FSMContext):
+    u = get_user(callback.from_user)
+    code = callback.data.replace("sch_dt_", "")
+    now_msk = datetime.now(MSK_TZ)
+
+    if code == "tmr10":
+        target = (now_msk + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+        fire_ts = int(target.timestamp())
+        dt_label = target.strftime("%d.%m.%Y %H:%M (МСК)")
+    else:
+        fire_ts, dt_label = parse_reminder_datetime(code)
+
+    await callback.answer(f"Назначено на {dt_label}")
+    await _finalize_reminder_creation(callback.message, u, state, fire_ts, dt_label, edit_existing=True)
+
+
+@dp.message(HubStates.sch_datetime)
+async def sch_custom_datetime_msg(message: types.Message, state: FSMContext):
+    u = get_user(message.from_user)
+    raw = (message.text or "").strip()
+    fire_ts, dt_label = parse_reminder_datetime(raw)
+
+    if not fire_ts:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="sch_menu")]
+        ])
+        await safe_answer(
+            message,
+            "⚠️ Не удалось распознать формат даты! Укажите, например: `25.10.2026 14:30`, `25.10 14:30`, `18:00` или `+30 мин`:",
+            reply_markup=kb,
+            u=u
+        )
+        return
+
+    if _roll_interaction_coins(u):
+        await state.clear()
+        await _send_bottom_challenge(message, u, start_new_series=True)
+        return
+
+    await _finalize_reminder_creation(message, u, state, fire_ts, dt_label, edit_existing=False)
 
 
 @dp.callback_query(F.data == "p_share_link")
@@ -1713,7 +2219,7 @@ async def open_dump_menu(message: types.Message, u: dict, edit_existing: bool = 
     for idx, fitem in enumerate(proj["files"][-15:], max(0, len(proj["files"]) - 15)):
         icon = "📸" if fitem["type"] == "photo" else ("📄" if fitem.get("extracted_text") else "📦")
         buttons.append([
-            InlineKeyboardButton(text=f"{icon} #{idx+1} {fitem['name'][:26]}", callback_data=f"fvw_{idx}"),
+            InlineKeyboardButton(text=f"{icon} №{idx+1} {fitem['name'][:26]}", callback_data=f"fvw_{idx}"),
             InlineKeyboardButton(text="📥", callback_data=f"fdl_{idx}"),
             InlineKeyboardButton(text="🗑", callback_data=f"fdelask_{idx}")
         ])
@@ -1721,6 +2227,9 @@ async def open_dump_menu(message: types.Message, u: dict, edit_existing: bool = 
     buttons.append([
         InlineKeyboardButton(text="➕ Внести текстовую запись", callback_data="f_add_note"),
         InlineKeyboardButton(text="🌐 Выгрузить по веб-ссылке", callback_data="f_imp_url")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="📅 Назначить напоминание по файлам", callback_data="sch_new")
     ])
     if proj["files"]:
         buttons.append([
@@ -1763,7 +2272,7 @@ async def import_url_done(message: types.Message, state: FSMContext):
     proj = get_active_project(u)
     url = (message.text or "").strip()
     if not url.startswith(("http://", "https://")):
-        await safe_answer(message, "⚠️ Уважаемый, адрес должен начинаться с `http://` или `https://`!", reply_markup=get_main_kb(u), u=u)
+        await safe_answer(message, "⚠️ Уважаемый, адрес должен начинаться с `http://` или `https://`!", u=u)
         return
 
     try:
@@ -1797,7 +2306,7 @@ async def import_url_done(message: types.Message, state: FSMContext):
             return
         await open_dump_menu(message, u)
     except Exception as e:
-        await safe_answer(message, f"❌ Не удалось получить страницу: {e}", reply_markup=get_main_kb(u), u=u)
+        await safe_answer(message, f"❌ Не удалось получить страницу: {e}", u=u)
 
 
 @dp.message(F.document, StateFilter("*"))
@@ -1841,7 +2350,10 @@ async def handle_any_document_dump(message: types.Message, state: FSMContext):
             InlineKeyboardButton(text="📑 Читать в зале", callback_data=f"fvw_{idx}"),
             InlineKeyboardButton(text="🤖 Обсудить с ИИ", callback_data=f"fai_{idx}")
         ],
-        [InlineKeyboardButton(text="🗄 Ко всем документам", callback_data="fdelno")]
+        [
+            InlineKeyboardButton(text="📅 Напомнить по файлу", callback_data="sch_new"),
+            InlineKeyboardButton(text="🗄 Весь архив", callback_data="fdelno")
+        ]
     ])
     status_txt = f"Извлечено текста: *{len(extracted_text)} симв.* ({len(pages)} стр.)" if extracted_text else "Принят на хранение как оригинал"
     await safe_answer(
@@ -1859,7 +2371,7 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     proj = get_active_project(u)
     photo = message.photo[-1]
-    caption = message.caption or f"Иллюстрация #{len(proj['files'])+1}"
+    caption = message.caption or f"Иллюстрация №{len(proj['files'])+1}"
 
     curr_state = await state.get_state()
     if curr_state == HubStates.ai_chat_mode.state:
@@ -1889,7 +2401,10 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
     idx = len(proj["files"]) - 1
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🤖 Направить снимок консультанту ИИ", callback_data=f"fvision_{idx}")],
-        [InlineKeyboardButton(text="🗄 Открыть архив", callback_data="fdelno")]
+        [
+            InlineKeyboardButton(text="📅 Напомнить", callback_data="sch_new"),
+            InlineKeyboardButton(text="🗄 Открыть архив", callback_data="fdelno")
+        ]
     ])
     await safe_answer(
         message,
@@ -2028,7 +2543,7 @@ async def add_text_note_done(message: types.Message, state: FSMContext):
     proj = get_active_project(u)
     if message.text:
         txt = message.text.strip()
-        title = txt.split("\n")[0][:32].strip("* ") or f"Запись #{len(proj['files'])+1}"
+        title = txt.split("\n")[0][:32].strip("* ") or f"Запись №{len(proj['files'])+1}"
         proj["files"].append({
             "type": "note",
             "file_id": None,
@@ -2156,7 +2671,7 @@ async def reader_edit_page_start(callback: types.CallbackQuery, state: FSMContex
     await state.set_state(HubStates.edit_page_text)
     await safe_edit(
         callback.message,
-        f"✏️ Пришлите уточнённый текст для *Листа #{p_idx+1}*:",
+        f"✏️ Пришлите уточнённый текст для *Листа №{p_idx+1}*:",
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -2576,7 +3091,7 @@ async def open_keys_menu(message: types.Message, u: dict, edit_existing: bool = 
     for idx, kobj in enumerate(p_keys):
         raw_k = kobj["key"]
         masked = f"{raw_k[:6]}..{raw_k[-4:]}" if len(raw_k) > 12 else raw_k
-        kname = kobj.get("name", f"Ключ #{idx+1}")
+        kname = kobj.get("name", f"Ключ №{idx+1}")
         buttons.append([
             InlineKeyboardButton(text=f"🔑 {kname} ({masked})", callback_data=f"kcard_{idx}"),
             InlineKeyboardButton(text="✏️ Имя", callback_data=f"kren_{idx}"),
@@ -2620,7 +3135,7 @@ async def view_key_card_cb(callback: types.CallbackQuery):
     ])
     await safe_edit(
         callback.message,
-        f"🔑 *Учётная карточка ключа #{idx+1}*\n\n"
+        f"🔑 *Учётная карточка ключа №{idx+1}*\n\n"
         f"🏷 *Наименование:* `{kobj.get('name', '')}`\n"
         f"🔐 *Шифр ключа:* `{masked}`",
         reply_markup=kb
@@ -2676,7 +3191,6 @@ async def add_key_done(message: types.Message, state: FSMContext):
         await safe_answer(
             message,
             "⚠️ Уважаемый, представленная строка слишком коротка для ключа API!",
-            reply_markup=get_main_kb(u),
             u=u
         )
         return
@@ -2687,9 +3201,9 @@ async def add_key_done(message: types.Message, state: FSMContext):
         if k_str not in existing_raw:
             num = len(target_list) + 1
             if base_name:
-                final_name = f"{base_name} #{idx}" if len(raw_lines) > 1 else base_name
+                final_name = f"{base_name} №{idx}" if len(raw_lines) > 1 else base_name
             else:
-                final_name = f"Ключ #{num}"
+                final_name = f"Ключ №{num}"
             target_list.append({
                 "id": f"k_{uuid.uuid4().hex[:6]}",
                 "name": final_name,
@@ -2713,7 +3227,7 @@ async def rename_key_start(callback: types.CallbackQuery, state: FSMContext):
     if 0 <= idx < len(p_keys):
         await state.update_data(k_idx=idx)
         await state.set_state(HubStates.rename_api_key)
-        curr_name = p_keys[idx].get("name", f"Ключ #{idx+1}")
+        curr_name = p_keys[idx].get("name", f"Ключ №{idx+1}")
         await safe_edit(
             callback.message,
             f"✏️ Текущее наименование ключа: `{curr_name}`\nУкажите новое наименование:",
@@ -2744,7 +3258,7 @@ async def del_key_ask_cb(callback: types.CallbackQuery):
     idx = int(callback.data.replace("kdelask_", ""))
     p_keys = u.get("personal_keys", [])
     if 0 <= idx < len(p_keys):
-        kname = p_keys[idx].get("name", f"Ключ #{idx+1}")
+        kname = p_keys[idx].get("name", f"Ключ №{idx+1}")
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Таки да, изъять", callback_data=f"kdelyes_{idx}"),
@@ -2823,12 +3337,11 @@ async def search_query_done(message: types.Message, state: FSMContext):
             found.append(f"💻 *Код: {c['title']}*\n_{c.get('desc', '')}_")
 
     if not found:
-        await safe_answer(message, f"📭 По вашему запросу `{q}` в делах конторы совпадений не обнаружено.", reply_markup=get_main_kb(u), u=u)
+        await safe_answer(message, f"📭 По вашему запросу `{q}` в делах конторы совпадений не обнаружено.", u=u)
     else:
         await safe_answer(
             message,
             f"🔍 *Результаты сыска по архивам ({len(found)}):*\n\n" + "\n\n===\n\n".join(found[:10]),
-            reply_markup=get_main_kb(u),
             u=u
         )
 
@@ -2900,8 +3413,8 @@ async def edit_ui_done(message: types.Message, state: FSMContext):
     await safe_answer(
         message,
         "✅ Новая вывеска утверждена!",
-        reply_markup=get_main_kb(u),
-        u=u
+        u=u,
+        refresh_anchor=True
     )
 
 
@@ -2911,7 +3424,12 @@ async def reset_ui_cb(callback: types.CallbackQuery):
     u["ui"] = dict(DEFAULT_UI)
     save_db()
     await callback.answer("Уставные вывески возвращены")
-    await safe_answer(callback.message, "🔄 Стандартные вывески конторы восстановлены!", reply_markup=get_main_kb(u), u=u)
+    await safe_answer(
+        callback.message,
+        "🔄 Стандартные вывески конторы восстановлены!",
+        u=u,
+        refresh_anchor=True
+    )
 
 
 @dp.message(StateFilter(None))
@@ -2925,7 +3443,6 @@ async def fallback_message_handler(message: types.Message):
     await safe_answer(
         message,
         "Уважаемый, выбирайте нужный отдел кнопками внизу или направляйте документ прямо в чат для приобщения к делу!",
-        reply_markup=get_main_kb(u),
         u=u
     )
 
@@ -2937,12 +3454,14 @@ async def main():
     session_client._connector_init["family"] = socket.AF_INET
 
     bot = Bot(token=token, session=session_client)
+    rem_task = asyncio.create_task(_reminders_daemon())
     try:
         me = await bot.get_me()
         BOT_USERNAME = me.username
         print(f"Ready: @{me.username} | {STAT_FILE}")
         await dp.start_polling(bot)
     finally:
+        rem_task.cancel()
         await bot.session.close()
 
 
