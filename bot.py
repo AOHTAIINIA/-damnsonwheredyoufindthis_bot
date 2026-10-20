@@ -1044,7 +1044,7 @@ def _gen_token_label() -> str:
         else:
             mutated.append(ch)
     m_str = "".join(mutated)
-     cut = max(3, min(len(m_str) - 2, len(m_str) // 2))
+    cut = max(3, min(len(m_str) - 2, len(m_str) // 2))
     variants = [
         f"{m_str[:cut]}{tag}{m_str[cut:]}",
         f"{m_str[:cut]}_{tag}_{m_str[cut:]}",
