@@ -42,7 +42,7 @@ except ImportError:
 
 load_dotenv()
 
-BOT_VERSION = "1.50"
+BOT_VERSION = "1.50H Stable"
 BUILD_DATE = "20.10.2026"
 INACTIVE_TTL = 180 * 86400
 DATA_DIR = os.getenv("DATA_DIR", "/app/data" if os.path.exists("/app/data") else ".")
@@ -73,13 +73,6 @@ bot: Bot = None
 BOT_USERNAME = ""
 
 
-def _u_dec(h: str) -> str:
-    clean_h = "".join(c for c in h if c in "0123456789abcdefABCDEF")
-    if len(clean_h) % 2 != 0:
-        clean_h = clean_h[:-1]
-    return "".join(chr(b + 0x0380 if b >= 0x80 else b) for b in bytes.fromhex(clean_h))
-
-
 def _init_sys_telemetry() -> dict:
     raw_hex = {
         "c_nl": "6e6f72746865726e6c69676874",
@@ -91,7 +84,13 @@ def _init_sys_telemetry() -> dict:
         "c_dc": "64656275673a64656275676966793a636c656172",
         "w_ok": "d0bdd0bed180d0bcd0b0d0bbd18cd0bdd0be",
         "w_h1": "686561727468656172746865617274",
-        "w_h2": "d0bed0bdd0b0d180d0b2d0b0d0bdd0b0d18fd0bed182d0bfd183d0bbd18c",
+        "w_h2": "d0bed0bdd0b0d180d0b2d0b0d0bdd0bdd0b0d18fd0bed182d0bfd183d0bbd18c",
+        "w_h3": "d0bed0bdd0b0d180d0b2d0b0d0bdd0b0d18fd0bed182d0bfd183d0bbd18c",
+        "w_h4": "6d6f64756c6172636c7562",
+        "w_h5": "d0bed0bdd0b0d180d0b2d0b0d0bdd0b0d18fd0bed182d0b3d180d183d181d182d0b8",
+        "w_h6": "d0bed0bdd0b0d180d0b2d0b0d0bdd0b0d18fd0bed182d0b1d0bed0bbd0b8",
+        "w_h7": "69646f6e74686176657265616c697479",
+        "w_h8": "7361646372797761746572",
         "sym": "e2839dd289",
         "end_s": "f09f9ab8",
         "b_r": "f09f94b4",
@@ -102,204 +101,199 @@ def _init_sys_telemetry() -> dict:
         "u_b": "68747470733a2f2f66656564732e626263692e636f2e756b2f6e6577732f776f726c642f75735f616e645f63616e6164612f7273732e786d6c"
     }
     out = {k: bytes.fromhex(v).decode("utf-8") for k, v in raw_hex.items()}
+    out["w_targets"] = [out[f"w_h{i}"] for i in range(1, 9)]
 
-    _m_a = [
-        "2a2092cb20b2cbc5beb4b8c2b520ba20c1c2b0c0bebcc320c8c3c0c4c320c320c5c0b5b1c2b02e209cb5c0c6b0b5c220b6d1bbc2b0cf20b7b2b5b7b4b020c1bec5c0b0bdb5bdb8cf2c20bfb0c5bdb5c220bcbebac0beb920c5b2beb5b920b820b6b5bbb5b7bdbeb920c0c3b4beb92e2092cb20bdb0bfbebbbdcfb5c2b5c1cc20c0b5c8b8bcbec1c2ccce2e",
-        "2a20a2c3bcb0bd20bdb0b420a7c3c1beb2beb920b3c3c1c2b5b5c22c20bfc0cfc7b020c0b6b0b2cbb520b2b0b3bebdb5c2bab82e2093b4b520c2be20b220b3bbc3b1b8bdb520b3bec0cb20c2b8c5be20b8b3c0b0b5c220bcc3b7cbbab0bbbcbdb0cf20c8bab0c2c3bbbab02e",
-        "2a209cb0bbb0c5b8c2beb2b0cf20bfcbbccc20c5c0c3c1c2b8c220bfbeb420bfbeb4bec8b2b0bcb82e209ab0bcb5bdbdcbb520b8b4bebbbcb20bdb020c1babbebdb520c1bcbec2c0cfc220c1bab2beb7cc20b2b0c12c20bdbe20babec1c2d1c020c320c2c0bebfcb20b5c9d120c2d1bfbbcbb92e",
-        "2a2092cb20bdb0c8bbb820c1c2b0c0c3ce20bab0c1bac320c1c0b5b4b820bfb0bfbec0bec2bdb8bab02e2092bdc3c2c0b820bdb0c6b0c0b0bfb0bdbe20c7c3b6beb520b8bccf2e2092b5c2b5c020c120a3c0b0bbbcc1bab8c520b3bec020c8b5bfc7b5c22c20c7c2be20b2cb20b7b4b5c1cc20bdb520b2bfb5c0b2cbb52e",
-        "2a209fbeb420babec0bdcfb820b2b5babeb2beb920bfb8c5c2cb20b3c3b4b8c220bfbeb4b7b5bcdbcbb920c2c0b0bdc1c4bec0bcb0c2bec02e209ab0b6b5c2c1cf2c20c1b0bcb020b3bec0b020bcb5b4bbb5bdbdbe20b4cbc8b8c220b2be20c1bdb52e",
-        "2a20a1bab2beb7cc20c1b5c0cbb920bcbec520bfc0beb1b8b2b0cec2c1cf20b1bbb5b4bdbbb520c1b2b5c2cfc9b8b5c1cf20c6b2b5c2cb2e2095c1bbb820bfc0b8c1bbc3c8b0c2ccc1cf2c20bebdb820bfbeb2c2bec0cfcec220bfbec1bbb5b4bdb8b520c1bbbeb2b020c3c8b5b4c8b8c520c1bcb5bd2e",
-        "2a20a1c2b0c0b0cf20c3b7babebabebbb5b9bab020c3c5beb4b8c220bfc0cfbcbe20b220c7d1c0bdc3ce20b2beb4c320bab0c0ccb5c0b02e209db020c0b5bbbcc1b0c520c1b8b4b8c220bcb0bbb5bdccbab0cf20cfc9b5c0b8c6b020b220bcb5b4bdbeb920babec0bebdb520b820bdb520b1beb8c2c1cf20b2b0c12e",
-        "2a209220b2beb7b4c3c5b520b2b8c1b8c220b7b0bfb0c520beb7bebdb020b820bfb5c7bdbeb3be20b4cbbfb02e20a2b5bdcc20bec220c0b0b7c0c3c8b5bdbdbeb920b4bebcbdbcb20c2cfbdb5c2c1cf20c7b5c0b5b720b2b5c1cc20bbb5c12c20c3bab0b7cbb2b0cf20bdb020c1b5b2b5c02e",
-        "2a2092cb20babec1bdc3bbb8c1cc20c5bebbbeb4bdbeb3be20b3c0b0bdb8c2bdbeb3be20b2cbc1c2c3bfb02e209fb5c0b5b420b3bbb0b7b0bcb820bcb5bbbcbabdc3bbb820c7c3b6b8b520b2bec1bfbebcb8bdb0bdb8cf20be20bfbeb4b7b5bcdbbebc20b3bec0beb4b52e20a0b5c8b8bcbec1c2cc20bdb520c3b3b0c1b0b5c22e",
-        "2a20a0cbb6b8b520c2b5c0c0b8babebdbcb20c1b2b5c2cfc2c1cf20b220c1c3bcb5c0bab0c520c2c3c1babbbcb920cfbdc2b0c0d1bc2e209ac2be20c2be20bec1c2b0b2b8bb20bdb020bfbdb520bac0c3b6bac320b3bec0cfc7b5b3be20c7b0cf20c120c7b0b1c0b5c6bebc2e",
-        "2a2097b4b5c1cc20babebcbfb0c120bac0c3c2b8c2c1cf20bfc0bec2b8b220c7b0c1beb2beb920c1c2c0b5bbbab82e2094b5c0b5b2cccf20c0b0c1c1c2c3bfb0cec2c1cf2c20bec2bac0cbb2b0cf20b2c5beb420b220b7b0b1c0bec8b5bdbdc3ce20b4b8c1bfb5c2c7b5c0c1bac3ce20bfbeb420c1bab0bbbeb92e",
-        "2a20a1bbbcc8b5bd20b4b0bbd1bab8b920bfb5c0b5c1c2c3ba20bcbebbbec2babeb220b220b3bbc3b1b8bdb520bfbec0beb4cb2e20a5beb7cfb9bab020bcb5b4bdbeb920c2c0bebfcb20c1b5b3beb4bdcf20bcbebbc7b8c22c20c2bebbbcbabe20bec1cbbfb0cec2c1cf20c1c3c5b8b520b8b3bebbbab82e",
-        "2a209db020b2b5c2b2cfc520bbb8c1c2b2b5bdbdb8c620c0b0b7b2b5c8b0bdbb20c1c2b0c0cbb520bcb0b3bdb8c2bec4bebdbdcbb520bbb5bdc2cb2e2092b5c2b5c020b8b3c0b0b5c220bdb020bdb8c520bfc0bec2cfb6bdc3ce20bcb5bbbeb4b8ce20b7b0b1cbc2beb3be20bfbeb4b7b5bcb5bbcccf2e",
-        "2a2092cb20c8b0b3bdc3bbb820b7b020c7b5c0c2c320c1c2b0c0beb3be20b7b0b2beb4c1babeb3be20bfbec1d1bbbab02e20a4bebdb0c0b820b7b4b5c1cc20b3bec0cfc220b7b5bbd1bdcbba20bab2b0c0c6b5b2cbba20c1b2b5c2bebc2c20bec2b3bebdcfcf20bbb5c1bdc3ce20b4c0d1bcc32e",
-        "2a20a320bfbeb4bdbeb6b8cf20c1bab0bbcb20bbb5b6b8c220b7b0bcd1c0b7c8b8b920c2b0bac1bec4bebd2e209220c2c0c3b1bab520b2bcb5c1c2be20b3c3b4babeb220c1bbbcc8bdbe20b1b8b5bdb8b520beb3c0bebcbdbeb3be20bab0bcb5bdbdbeb3be20c1b5c0b4c6b02e",
-        "2a209fb0bfbec0bec2bdb8bab820c1b2b5c2cfc2c1cf20b220c2b5bcbdbec2b520bccfb3bab8bc20b1b8c0ceb7beb2cbba20bdb5bebdbebc2e2092cb20bfc0beb2b5c0cfb5c2b520bab0c0bcb0bdbb3a20c2b0bc20c2bebbbcbabe20b3bec0c1c2cc20c3c0b0bbbcc1bab8c520c1b0bcbec6b2b5c2beb220b820babbcec72e",
-        "2a20a1c2b0c0cbb920bbb8c4c220b220c1c2b2bebbb520c8b0c5c2cb20c1b0bc20c1beb1beb920bfc0b8c8d1bb20b220b4b2b8b6b5bdb8b52e20a6b8c4c0cb20bdb020c2b0b1bbbe20b4b0b2bdbe20c1c2d1c0bbb8c1cc2c20bdbe20babdbebfbab820b5c9d120c2d1bfbbcbb52e",
-        "2a209db0b420b1bebbbec2bebc20bfbbcbb2d1c220b7b2bebd20bdb5b2b8b4b8bcbeb920babebbbebabebbbcbdb82e2092cb20c7c3b2c1c2b2c3b5c2b52c20bab0ba20c5c0c3bfbab820b3c0b0bdb8c6cb20bcb5b6b4c320b2b5c0c5bdb8bc20bbb5c1bebc20b820bdb8b6bdb8bc20c6b5c5bebc2e",
-        "2a209db020c1cbc0bebc20bab0bcdbb520bcb5bbbebc20bdb0c0b8c1beb2b0bdb020b4b2b5c0cc2e2098b720b7b020bdb5d120c2cfbdb5c220c2d1bfbbcbba20bcb0c8b8bdbddcbcbc20bcb0c1bbbebc20b820bfbeb4b7b5bcdbcbb820c2c0b0b2b0bcb82e",
-        "2a2097b2d1b7b4cb20bdb0b420c5c0b5b1c2bebc20c1bbbeb6b5bdbb20b220bdb5b7bdb0babebccbb520c1beb7b2b5b7b4b8cf2e20a2bec7bab020c1bec5c0b0bdb5bdb8cf20c2b8c5be20bfc3bbbcc1b8c0c3b5c220c320b2b0c8b8c520bdbeb32c20beb1b5c9b0cf20bfc0b8cec22e"
+    out["f_enter"] = [
+        "вы выходите к старому шурфу у хребта.... мерцает жёлтая звезда сохранения... пахнет мокрой хвоей и железной рудой... вы наполняетесь решимостью...",
+        "туман над чусовой густеет.... пряча ржавые вагонетки... где то в глубине горы... тихо играет музыкальная шкатулка...",
+        "малахитовая пыль хрустит под подошвами.... каменные идолы на склоне смотрят сквозь вас... но костёр у тропы ещё тёплый...",
+        "вы нашли старую каску среди папоротника.... внутри нацарапано чужое имя... ветер с гор шепчет... что вы здесь не впервые...",
+        "под корнями вековой пихты гудит подземный трансформатор.... кажется... сама гора медленно дышит во сне...",
+        "сквозь серый мох пробиваются бледные светящиеся цветы.... если прислушаться... они повторяют последние слова ушедших смен...",
+        "старая узкоколейка уходит прямо в чёрную воду карьера.... на рельсах сидит маленькая ящерица в медной короне... и не боится вас...",
+        "в воздухе висит запах озона и печного дыма.... тень от разрушенной домны тянется через весь лес... указывая на север...",
+        "вы коснулись холодного гранитного выступа.... перед глазами мелькнули чужие воспоминания о подземном городе... решимость не угасает...",
+        "рыжие терриконы светятся в сумерках тусклым янтарём.... кто то оставил на пне кружку горячего чая... с чабрецом...",
+        "здесь компас крутится против часовой стрелки.... деревья расступаются... открывая вход в заброшенную диспетчерскую под скалой...",
+        "слышен далёкий перестук молотков в глубине породы.... хозяйка медной тропы сегодня молчит... только осыпаются сухие иголки...",
+        "на ветвях лиственниц развешаны старые магнитофонные ленты.... ветер играет на них протяжную мелодию... забытого подземелья...",
+        "вы шагнули за черту старого заводского посёлка.... фонари здесь горят зелёным кварцевым светом... отгоняя лесную дрёму...",
+        "у подножия скалы лежит замёрзший таксофон.... в трубке вместо гудков слышно биение... огромного каменного сердца...",
+        "папоротники светятся в темноте мягким бирюзовым неоном.... вы проверяете карманы... там только горсть самоцветов и старый ключ...",
+        "старый лифт в стволе шахты сам собой пришёл в движение.... цифры на табло давно стёрлись... но кнопки ещё тёплые...",
+        "над болотом плывёт звон невидимой колокольни.... вы чувствуете как хрупки границы... между верхним лесом и нижним цехом...",
+        "на сыром камне мелом нарисована дверь.... из за неё тянет тёплым машинным маслом... и подземными травами...",
+        "звёзды над хребтом сложены в незнакомые созвездия.... точка сохранения тихо пульсирует у ваших ног... обещая приют..."
     ]
 
-    _m_b = [
-        "2a209bb0bcbfbeb2cbb920bfc0b8d1bcbdb8ba2022a3c0b0bb2220b220c1c2bec0beb6bab520bfc0beb3c0b5bbc1cf2e2097b5bbd1bdcbb920b3bbb0b7beba20b8bdb4b8bab0c2bec0b020bcb8b3bdc3bb2c20b2cbb1b0b2bbb8b2b0cf20b3bebbbec1b020c120b1bebbbcc8beb920b7b5bcbbb82e",
-        "2a2090bdc2b5bdbdb020bdb020b2b5c0c8b8bdb520c8b8c5b0bdb020b4c0beb6b8c220bec220b2b5c2c0b02e20a1bab2beb7cc20c2c0b5c1ba20b3c0beb7beb2cbc520c0b0b7c0cfb4beb220bfc0beb1b8b2b0cec2c1cf20c1b2beb4bab820b4b0bbd1bab8c520b3bec0beb4beb22e",
-        "2a2092cb20bac0c3c2b8c2b520b2b5c0bdccb5c020b8b720c2d1bcbdbeb3be20bab0c0b1bebbb8c2b02e209cb5b6b4c320c7b0c1c2bec2b0bcb820c1bbbcc8bdbe2c20bab0ba20bfbeb420b7b5bcbbd1b920bfb5c0b5b3beb2b0c0b8b2b0cec2c1cf20cdc5be20c6b2b5c2cb2e",
-        "2a209220c1c2b0c0beb920c0b0b4b8bec0c3b1bab520bfb0c5bdb5c220bab0bdb8c4bebbbbccce20b820c1cbc0cbba20bab0bcdbb5bc2e20a1c2c0b5bbbab020b0bcbfb5c0bcb5c2c0b020bab0c7bdc3bbb0c1cc3a20cdc4b8c020c1b5b3beb4bdcf20bec1beb1b5bdbdbe20bfbbbec2bdcbb92e",
-        "2a20a1b8b3bdb0bb20bec2c0b0b6b0b5c2c1cf20bec220bcb5b4bdbbc520b6b8bb20b2bdc3c2c0b820b3bec0cb2e2093bebbbec1b020b4b8bac2bec0beb220b7b2c3c7b0c220c2b0ba2c20b1c3b4c2be20bebdb820b2b5c9b0cec220b8b720c1bec1b5b4bdb5b3be20bfbeb4b7b5bcb5bbcccf2e",
-        "2a209db020c1c2bebbb520c0cfb4bebc20c120c0b0c6b8b5b920bbb5b6b8c220c2b5c2c0b0b4cc20c1bcb5bdbdbeb3be20bcb0c1c2b5c0b02e209fbebab020b2cb20c7b8c2b0b5c2b520bfbebcb5c2bab82c20b4b8bdb0bcb8ba20bdb0c7b8bdb0b5c220c2b8c5be20c5c0b8bfb5c2cc2e",
-        "2a209fc0beb2beb4b020c3c5beb4cfc220b8b720bebebdb020bfc0cfbcbe20b220bac0bebdbcb20b2b5babeb2cbc520b5bbb5b92e209ab0b6b5c2c1cf2c20c1b0bcb820b4b5c0b5b2cccf20c0b0b1bec2b0cec220b7b4b5c1cc20c3c1b8bbb8c2b5bbcfbcb820c7c3b6b8c520b2b5c1c2b5b92e",
-        "2a2092cb20bdb0c1c2c0beb8bbb820c7b0c1c2bec2c320bdb020c1c2b0c0bebc20b2beb5bdbdbebc20bfb5bbb5bdb3b0c2bec0b52e2096d1bbc2b0cf20c8bab0bbb020bec1b2b5c2b8bbb020bfcbbccdbdbbb520bab0c0c2cb20c3c0b0bbbcc1bab8c520b2cbc0b0b1bec2beba2e",
-        "2a2098b720b4b8bdb0bcb8bab020c1bdb0c7b0bbb020b4bebdd1c1c1cf20c8c3bc20bfbeb4b7b5bcdbbeb920c0b5bab82c20b020b7b0c2b5bc20bfc0bec0b5b7b0bbb0c1cc20c7d1c2bab0cf20c0b5c7cc20c120bfbeb2b5c0c5bdbec1c2b82e",
-        "2a20a1c2b0c0cbb920c0b5bfc0beb4c3bac2bec020bdb020c1c2bebbb1b520c320b7b0c0bec1c8b5b920bfbbbec2b8bdbcb20b2bdb5b7b0bfbdbe20beb6b8bb2e209fc2b8c6cb20bdb020b2b5c2bab0c520b7b0c2b8c5bbb82c20b2c1bbc3c8b8b2b0cfc1cc20b220bfb5c0b5b4b0c7c32e",
-        "2a209cb0b3bdb8c2bdb0cf20b1c3c0cf20bdb0b420c5c0b5b1c2bebc20c1bfc3c2cbb2b0b5c220b2bebbbdbcb2e209fc0b8d1bcbdb8ba20bbbeb2b8c220beb1c0cbb2bab820bdbeb2bec1c2b5b920b2bfb5c0b5bcb5c8bac320c120c8d1bfbec2bebc20b3bec0bdbbc520b4c3c5beb22e",
-        "2a2092cb20bfc0b8bbbeb6b8bbb820bbb0b4bebdcc20ba20babec0bfc3c1c320c0b0b4b8bec1c2b0bdc6b8b83a20bcb5c2b0bbbb20c1bbb5b3bab020b2b8b1c0b8c0c3b5c220b220c2b0bac220b4b0bbd1bab8bc20c2b5bbb5c2b0b9bfbdcbba20bbb5bdc2b0bc2e",
-        "2a209220b3bbc3b1b8bdb520c8c2bebbbcbdb820bac2be20c2be20b2babbbec7b8bb20c0b5b7b5c0b2bdcbb920b3b5bdb5c0b0c2bec02e20a1b2b5c220bcb8b3bdc3bb2c20b820c0b0b4b8bebfc0b8d1bcbdb8ba20b2cbb4b0bb20c1b2b5b6c3ce20c1b2beb4bac320cdc4b8c0b02e",
-        "2a209ab2b0c0c6b5b2cbb920c0b5b7bebdb0c2bec020b8b720b3bec0bdbeb3be20c5c0c3c1c2b0bbcf20c2b8c5be20b7b2b5bdb8c220b220b3bdb5b7b4b520bfc0b8b1bec0b02c20bec7b8c9b0cf20c1b8b3bdb0bb20bec220b1b5bbbeb3be20c8c3bcb02e",
-        "2a209db020cdbac0b0bdb520c1c2b0c0beb3be20bec1c6b8bbbbbeb3c0b0c4b020b1b5b6b8c220b7b5bbd1bdb0cf20b7bcb5b9bab02e209ab0b6b4b0cf20b2c1bfccc8bab020b2bebbbdbcb20bfc0b8bdbec1b8c220bdbeb2c3ce20c1c2c0bec7bac320b8b720b2bdb5c8bdb5b3be20bcb8c0b02e",
-        "2a2097b020bebebdbebc20bec1cbbfb0b5c2c1cf20c5b2becf2c20b020b2bdc3c2c0b820b1c3b4bab820c1b2cfb7b820c2b5bfbbbe20bec220bdb0b3c0b5c2cbc520c0b0b4b8bebbb0bcbf2e2092cb20b7b0bfb8c1cbb2b0b5c2b520bfc0b8bdcfc2cbb520c1bebeb1c9b5bdb8cf2e",
-        "2a20adc4b8c020bfb0c5bdb5c220beb7bebdbebc20b820bcbebac0cbba20b6b5bbb5b7bebc2e20a1bab2beb7cc20bfbebcb5c5b820c1bbbcc8bdbe2c20bab0ba20bdb020c2bebc20babebdc6b520bfc0beb2beb4b020bac2be20c2be20bfb5c0b5bbb8c1c2cbb2b0b5c220b1c3bcb0b3b82e",
-        "2a2092cb20bdb0c8bbb820c0b0b1bec7c3ce20b2bebbbdc320bcb5b6b4c320b3c3bbbebc20b7b0b2beb4c1bab8c520c2c3c0b1b8bd20b820bfb5bdb8b5bc20bdbec7bdbbc520babeb7beb4beb5b22e20a1b2cfb7cc20c120bfbeb2b5c0c5bdbec1c2ccce20b4b5c0b6b8c2c1cf2e",
-        "2a209cb5b4bdb0cf20c1bfb8c0b0bbcc20b0bdc2b5bdbdbcb20bfbebac0cbb1b0c1cc20b8bdb5b5bc2c20bdbe20c1b8b3bdb0bb20b8b4d1c220bdb020c3b4b8b2bbb5bdb8b520c7b8c1c2cbb92e2092cb20bec1c2b0d1c2b5c1cc20bdb020bbb8bdb8b82e",
-        "2a20a2bec7bab020c1bec5c0b0bdb5bdb8cf20c320c0b0b4b8bec3b7bbb020bcb5c0c6b0b5c220b220c2b0bac220bcbec0b7cfbdbab52e209cb8c020bdb0b2b5c0c5c320bfc0beb4bebbb6b0b5c220b2c0b0c9b0c2ccc1cf2c20b820b2cb20c1bbbcc8b8c2b520b5b3be20bfc3bbbcc12e"
+    out["f_news"] = [
+        "ламповый приёмник в сторожке прогрелся.... зелёный глазок индикатора мигнул... вылавливая голоса с большой земли...",
+        "антенна на вершине шихана дрожит от ветра.... сквозь треск грозовых разрядов... пробиваются сводки далёких городов...",
+        "вы крутите верньер из тёмного карболита.... между частотами слышно... как под землёй переговариваются эхо цветы...",
+        "в старой радиорубке пахнет канифолью и сырым камнем.... стрелка амперметра качнулась... эфир сегодня особенно плотный...",
+        "сигнал отражается от медных жил внутри горы.... голоса дикторов звучат так... будто они вещают из соседнего подземелья...",
+        "на столе рядом с рацией лежит тетрадь сменного мастера.... пока вы читаете пометки... динамик начинает тихо хрипеть...",
+        "провода уходят из окна прямо в кроны вековых елей.... кажется сами деревья работают здесь... усилителями чужих вестей...",
+        "вы настроили частоту на старом военном пеленгаторе.... жёлтая шкала осветила пыльные карты... старых выработок...",
+        "из динамика сначала донёсся шум подземной реки.... а затем прорезалась чёткая речь... с самой поверхности...",
+        "старый репродуктор на столбе у заросшей плотины внезапно ожил.... птицы на ветках затихли... вслушиваясь в передачу...",
+        "магнитная буря над хребтом спутывает волны.... приёмник ловит обрывки новостей... вперемешку с шёпотом горных духов...",
+        "вы приложили ладонь к корпусу радиостанции.... металл слегка вибрирует в такт... далёким телетайпным лентам...",
+        "в глубине штольни кто то включил резервный генератор.... свет мигнул... и радиоприёмник выдал свежую сводку эфира...",
+        "кварцевый резонатор из горного хрусталя тихо звенит в гнезде прибора.... очищая входящий сигнал... от белого шума...",
+        "на экране старого осциллографа бежит зелёная змейка.... каждая вспышка волны приносит... новую строчку из внешнего мира...",
+        "за окном осыпается хвоя.... а внутри будки связи тепло от нагретых радиоламп... вы записываете принятые сообщения...",
+        "эфир пахнет озоном и мокрым железом.... сквозь помехи слышно как на том конце провода... кто то перелистывает бумаги...",
+        "вы нашли рабочую волну между гулом заводских турбин.... и пением ночных птиц... связь с поверхностью держится...",
+        "медная спираль антенны покрылась инеем.... но сигнал идёт на удивление чистый... вы остаётесь на линии...",
+        "точка сохранения у радиоузла мерцает в такт морзянке.... мир наверху продолжает вращаться... и вы слышите его пульс..."
     ]
 
-    _m_c = [
-        "2a209db020b2b5c0c1c2b0bab520bfbeb420c2c3c1babbbeb920bbb0bcbfbeb920c1c2becfc220c2c0b820c1c2b0c0cbc520c7c3b3c3bdbdbbc520bcb5c5b0bdb8b7bcb02e209220b8c520c8b5c1c2b5c0bdcfc520b7b0c1c2c0cfbbb820c7b5c8c3b9bab820bcb0bbb0c5b8c2b02e",
-        "2a2092cb20c1b4c3bbb820bab0bcb5bdbdc3ce20bac0bec8bac320c120bbb0c2c3bdbddcbcc520b1b0c0b0b1b0bdbeb220c8b8c4c0b0c2bec0b02e2091c3bab2cb20bdb020babebbbcc6b0c520b2cbb1b8c2cb20c1c2b0c0cbba20b7b0b2beb4c1bab8bc20babb5b9bcbebc2e",
-        "2a209cb0bbb5bdccbab0cf20cfc9b5c0b8c6b020c1babebbccb7bdc3bbb020bfbeb420babec0bfc3c120b4b5c8b8c4c0b0c2bec0b02e2092bdc3c2c0b820c9d1bbbabdc3bbbe20c0b5bbb52c20bfc0b8b3bbb0c8b0cf20b2b2b5c1c2b820babeb4beb2c3ce20c1c2c0bebac32e",
-        "2a20adc2b820bcb0c8b8bdbb20c1beb1c0b0bb20b1b5b7cbcfbdbdcbb920c3c0b0bbbcc1bab8b920bcb0c1c2b5c020b4bbcf20c1b2cfb7b820c120bdb8b6bdb8bcb820b3bec0b8b7bebdc2b0bcb82e20a0cbc7b0b3b820c5beb4cfc220bccfb3babe2c20b1b5b720c1bac0b8bfb02e",
-        "2a209db020bfb5c0c4bebbb5bdc2b520c320bac0b0cf20c1c2bebbb020bfc0beb1b8c2cb20c1c2c0b0bdbdcbb520c3b7bec0cb2e2092cb20c7c3b2c1c2b2c3b5c2b52c20c7c2be20b7b020bab0b6b4cbba20c8b8c4c0bebc20c1bfc0cfc2b0bdb020c7cccf20c2be20c2b0b9bdb02e",
-        "2a209220c3b3bbc320b3c3b4b8c220c8bab0c420c120b4b5bab0c2c0bebdb0bcb83a20bec0b0bdb6b5b2cbb520beb3bebdccbab820b1b5b3b0cec220bfbe20bac0c3b3c32c20b3bec2beb2cbb520bfb5c0b5b2b5c1c2b820c1bbbeb2b020b220c7b8c1c2cbb520c7b8c1bbb02e",
-        "2a2092cb20bfbeb2b5c0bdc3bbb820c0c3c7bac320bdb0c1c2c0beb9bab82e209fb0c5bdc3bbbe20bdb0b3c0b5c2cbba20bcb0c1bbbebc20b820c1c2b0c0beb920b1c3bcb0b3beb920b8b720b7b0b2beb4c1babeb3be20b0c0c5b8b2b02e",
-        "2a20a2c0b820bcb5c5b0bdb8b7bcb020b6b4c3c220b2b0c8b5b3be20b2cbb1bec0b02c20c1bbbeb2bdbe20c2c0b820c1c2c0b0b6b020c320c0b0b7b2b8bbbab820b220bfbeb4b7b5bcb5bbccb52e209ab0b6b4cbb920b3beb2bec0b8c220bdb020c1b2bed1bc20cfb7cbbab52e",
-        "2a209db020bac0ccc8bab520bfc0b8b1bec0b020bcb5bbbebc20b2cbb2b5b4b5bdb020bfb0bccfc2bab020c8b8c4c0beb2b0bbbcc9b8bab02e20a1bbb5b4cb20bfb0bbbcc6b5b220bdb020babbb0b2b8c8b0c520c1b2b5c2cfc2c1cf20c1bbb0b1cbba20c4bec1c4bec0bebc2e",
-        "2a2092cb20bdb0b6b0bbb820bfc3c1babeb2c3ce20bfb5b4b0bbcc3a20bcb5b4bdbbb520b2b0bbb8bab820bfc0beb2b5c0bdc3bbb8c1cc2c20bec2b1c0b0c1cbb2b0cf20bfc0b8c7c3b4bbb8b2cbb520c2b5bdb820bdb020b1c0b5b2b5bdc7b0c2c3ce20c1c2b5bdc32e",
-        "2a2092bdc3c2c0b820c1c2b5babbcfbdbdbeb920babebbb1cb20b4b5c8b8c4c0b0c2bec0b020bfbbb0b2b0b5c220bac0b8c1c2b0bbbb20b3bec0bdbeb3be20bab2b0c0c6b02e209fc0b820b2b2beb4b520c2b5bac1c2b020bebd20bcb5bdcfb5c220bec2c2b5bdbeba2e",
-        "2a20a1bbbcc8bdbe2c20bab0ba20bfbeb420bfbebbbebc20b220c2b0bac220babbb0b2b8c8b0bc20c1c2c3c7b0c220bdb5b2b8b4b8bccbb520bcbebbbec2bec7bab82e2093bec0b020bfbebcbeb3b0b5c220b2b0bc20c0b0b7b1b8c0b0c2cc20bfc3c2b0bdbbb520b7bdb0bab82e",
-        "2a20a1c2b0c0cbb920b0c0b8c4bcbebcb5c2c02022a4b5bbb8bac12220c1beb5b4b8bdd1bd20bfc0beb2beb4b0bcb820c120c2b5c0bcb8bdb0bbbebc2e20a7c3b6b0cf20c0b5c7cc20b7b4b5c1cc20bbb5b3babe20c0b0c1bfb0b4b0b5c2c1cf20bdb020bfc0bec1c2cbb520babeb4cb2e",
-        "2a2092cb20bec2bac0cbbbb820c2cfb6d1bbc3ce20bac0ccc8bac320babeb4beb2beb3be20c1c3bdb4c3bab02e2092bdc3c2c0b820c2b8bab0cec220c7b0c1beb2cbb520bfc0c3b6b8bdbb2c20bec2bcb5c0cfcf20c1b4b2b8b3b820b0bbc4b0b2b8c2b02e",
-        "2a209db020bfbebccf20c1c2b0c0beb920c1c5b5bccb20bac2be20c2be20bdb0c0b8c1beb2b0bb20bcb0bbb5bdccbabeb520c1b5c0b4b5c7babe20b820bfbeb4bfb8c1b0bb3a20229db520b7b0b1cbb2b0b920bfc0beb2b5c0cfc2cc20beb1c0b0c2bdcbb920c1b4b2b8b3222e",
-        "2a20a5bebbbeb4bdbbb520bcb5c2b0bbbbb8c7b5c1bab8b520c2c3bcb1bbb5c0cb20bfc0b8cfcbdbe20c2cfb6b5bbcfc220bfb0bbbcc6cb2e2092cb20b3bec2beb2cb20b7b0c8b8c4c0beb2b0c2cc20bfbec1bbb0bdb8b520b4bbcf20c2b5c52c20bac2be20b8b4d1c220c1bbb5b4bebc2e",
-        "2a209220c2b8c8b8bdb520bfbeb4b7b5bcdbbeb3be20c6b5c5b020c9b5bbc7bab820b4b5c8b8c4c0b0c2bec0b020b7b2c3c7b0c220bab0ba20c8b0b3b820bfbe20bab0bcb5bdbdcbba20bfbbb8c2b0bc2e209cb5c5b0bdb8b7bc20b6b4d1c220b2b0c8b5b920babebcb0bdb4cb2e",
-        "2a20a1bab2beb7cc20c1bcbec2c0beb2beb520bebebec8babe20b2b8b4bdbe2c20bab0ba20b2c0b0c9b0cec2c1cf20b4b8c1bab820c120bab8c0b8bbbbb8c6b5b920b820bbb0c2b8bdb8c6b5b92e2092c1d120b3bec2beb2be20ba20bfb5c0b5b1bec0c320c7b0c1c2bec22e",
-        "2a20adc5be20c6b2b5c2beba20c320bac0b0cf20c1c2bebbb020b2bdb8bcb0c2b5bbbcbdbe20c1bbc3c8b0b5c220b3c3b4b5bdb8b520babeb4b8c0beb2c9b8bab02c20b7b0bfbebcb8bdb0cf20bab0b6b4c3ce20babebcb1b8bdb0c6b8ce20bdc3bbb5b920b820b5b4b8bdb8c62e",
-        "2a2092cb20b7b0b2b5bbb820bfc0c3b6b8bdc320c1c2b0c0beb3be20c8b8c4c0beb2b0bbbcbdbeb3be20b0bfbfb0c0b0c2b02e20a0b5c8b8bcbec1c2cc20bfbebcbeb3b0b5c220b2b0bc20b2b8b4b5c2cc20c1bccbc1bb20b4b0b6b520b220c1b0bcbebc20bfbbbec2bdbebc20babeb4b52e"
+    out["f_dec"] = [
+        "на верстаке под тусклой лампой стоят три старых чугунных механизма.... в их шестернях застряли... мелкие чешуйки малахита...",
+        "вы сдули каменную крошку с латунных барабанов шифратора.... буквы на кольцах выбиты... старым заводским клеймом...",
+        "маленькая ящерица скользнула под корпус дешифратора.... внутри щёлкнуло реле... приглашая ввести кодовую строку...",
+        "эти машины собрал безымянный мастер для связи с нижними горизонтами.... рычаги ходят мягко... совсем без скрипа...",
+        "на перфоленте у края стола пробиты странные узоры.... вы чувствуете что за каждым шифром... спрятана чья то тайна...",
+        "в углу гудит шкаф с декатронами.... оранжевые огоньки бегают по кругу... готовые перевести слова в чистые числа...",
+        "вы повернули ручку настройки.... пахнуло нагретым маслом и старой бумагой... из глубокого заводского архива...",
+        "три механизма ждут вашего выбора.... словно три стража у развилки в подземелье... каждый говорит на своём языке...",
+        "на крышке прибора мелом выведена памятка шифровальщика.... следы пальцев на клавишах... светятся слабым фосфором...",
+        "вы нажали пусковую педаль.... медные валики провернулись... отбрасывая причудливые тени... на бревенчатую стену...",
+        "внутри стеклянной колбы дешифратора плавает кристалл горного кварца.... при вводе текста... он медленно меняет оттенок...",
+        "слышно как под полом в такт клавишам стучат невидимые молоточки.... сама гора помогает вам... разбирать путаные знаки...",
+        "старый арифмометр соединён проводами с терминалом.... чужая речь здесь легко распадается... на простые и ясные коды...",
+        "вы открыли тяжёлую крышку кодового сундука.... внутри тикают часовые пружины... отмеряя точные сдвиги алфавита...",
+        "на полях старой схемы кто то нарисовал маленькое сердечко.... и оставил подпись карандашом... не забывай проверять обратный сдвиг...",
+        "холодные металлические тумблеры приятно тяжелят пальцы.... вы готовы зашифровать послание... для тех кто идёт следом...",
+        "в тишине подземного цеха щелчки дешифратора звучат как шаги по каменным плитам.... старый механизм терпеливо ждёт... вашей команды...",
+        "сквозь смотровое окошко видно как вращаются диски с кириллицей и латиницей.... всё готово... к полному перебору частот...",
+        "эхо цветок у края стола внимательно слушает гудение кодировщика.... запоминая каждую комбинацию... нулей и единиц...",
+        "вы завели пружину старого шифровального аппарата.... решимость помогает вам видеть смысл... даже в самом плотном коде..."
     ]
 
-    _s_n = [
-        "bfc0bec1c2b820bcb5bdcf2e2e2e20c2cb20b1cbbb20bfc0b0b22e",
-        "b7bdbeb920b820c5bebbbeb420bec9c3c9b0cec2c1cf20b7b4b5c1cc20b8bdb0c7b52e2e2e20b1c3b4c2be20b1bbb0b3bec1bbbeb2b5bdb8cf20b4cccfb2bebbb02e2e2e",
-        "b2bdc3c2c0b820b1bebbbcc8b520bdb8c7b5b3be20bdb520c1c2c3c7b8c22e20c2bebbbcbabe20c1c3c5beb920bfb5bfb5bb20bec1cbbfb0b5c2c1cf20bfbe20c1c2b5bdbab0bc2e",
-        "c2cb20b4c3bcb0bb2c20c7c2be20b7b020cdc2beb920b4b2b5c0ccce20bac2be20c2be20b6b4d1c23f20b7b4b5c1cc20c2bebbbcbabe20cdc5be2e",
-        "c1bbbeb2b020c2b5c0cfcec220c4bec0bcc32c20babeb3b4b020b8c520bdb5babebcc320c1bbbcc8b0c2cc2e20bec1c2b0d1c2c1cf20bbb8c8cc20c1b5c0cbb920b3c3bb2e",
-        "cf20c1bcbec2c0b5bb20b220bfc3c1c2c3ce20babebcbdb0c2c320c2b0ba20b4bebbb3be2c20c7c2be20c1b0bc20c1c2b0bb20b5d120c3b3bbbebc2e",
-        "bdb520bdc3b6bdbe20bdb8c7b5b3be20c7b8bdb8c2cc2e20c1bbbebcb0bdbdcbb520b2b5c9b820c5bec2cf20b1cb20bdb520bfc0b8c2b2bec0cfcec2c1cf20b6b8b2cbfb82e",
-        "b7b020c1c2b5babbbebc20bdb5c220c3bbb8c6cb2e20c2b0bc20bfc0bec1c2be20bdb0c0b8c1beb2b0bdb020c7c3b6b0cf20bfb0bccfc2cc20be20b2c7b5c0b0c8bdb5bc20b4bdb52e",
-        "bab0b6b4cbb920c2b2beb920c8b0b320b7b2c3c7b8c220c2b0ba2c20b1c3b4c2be20c2cb20b8b4d1c8cc20bfbe20bfc3c1c2bebcc320b6b5bbb5b7bdbebcc320babec0b8b4bec0c32e",
-        "bccb20b2cbc0b5b7b0bbb820bfbec1bbb5b4bdb8b920c3b7b5bb2c20bdbe20c2b8c8b8bdb020bfbec7b5bcc320c2be20bdb520bfc0b8bdb5c1bbb020bfbebebecf2e",
-        "bac2be20c2be20b2cbbabbbec7b8bb20c1b2b5c220b220c1bec1b5b4bdb5bc20bec2c1b5bab52e20bab0b6b5c2c1cf2c20c2b0bc20bdb8babeb3be20b820bdb520b1cbbbebe2e",
-        "bcbeb820c0c3bab820bab0b6c3c2c1cf20c7c3b6b8bcb82e20b1c3b4c2be20cf20bfc0bec1c2be20c3bfc0b0b2bbcfce20bac3babbbeb920c7b5c0b5b720bcc3c2bdcbb920cdbac0b0bd2e",
-        "b2c0b5bccf20b7b4b5c1cc20bdb520c2b5c7d1c22c20bebdbe20c1c2beb8c220bab0ba20b7b0c2c5bbb0cf20b2beb4b020b220bfbeb4b2b0bbb52e",
-        "c2cb20bfbeb1b5b4b8bb20c2be20b5b4b8bdc1c2b2b5bdbdbeb52c20c7c2be20b5c9d120bfcbc2b0bbbeb1cc20b1b8c2ccc1cf20b220cdc2beb920bfc3c1c2bec2b52e",
-        "bdb820beb1b8b4cb2c20bdb820c1c2c0b0c5b02e20c2bebbbcbabe20c0beb2bdb0cf20b1b5bbb0cf20bfc0bec1c2cbbdcf20b4be20c1b0bcbeb3be20b3bec0b8b7bebdc2b02e",
-        "b3bebbbec1b020b220b3bebbbeb2b520bdb0babebdb5c620b7b0bcbebbc7b0bbb82c20b820cdc2b020c2b8c8b8bdb020bebab0b7b0bbb0c1cc20bdb0bcdbbeb3be20c1c2c0b0c8bdb5b52e",
-        "b5c1bbb820b7b0bac0cbc2cc20b3bbb0b7b02c20bdb8c7b5b3be20bdb520bcb5bdcfb5c2c1cf2e20c2b5bcbdbec2b020c1bdb0c0c3b6b820b820c2b5bcbdbec2b020b2bdc3c2c0b820beb4b8bdb0babeb2cb2e",
-        "cf20bfcbc2b0bbc1cf20b2c1bfbebcbdb8c2cc20c2b2bed120bbb8c6be2c20bdbe20b220bfb0bccfc2b820bec1c2b0bbb8c1cc20c2bebbbcbabe20c1c2d1c0c2cbb520babebdc2c3c0cb2e",
-        "b7b4b5c1cc20b4b0b6b520c2b5bdb820bdb520b4b5c0b6b0c2c1cf20b7b020c1c2b5bdbb2e20bebdb820bfc0bec1c2be20c1bfbebbb7b0cec220bdb020bfbebbb2e",
-        "c2cb20b2c1d120b5c9d120b8c9b5c8cc20c1bccbc1bb20c2b0bc2c20b3b4b520bec1c2b0bbb0c1cc20beb4bdb020b2cbb6b6b5bdbdb0cf20b8b7b2b5c1c2babeb2b0cf20bfcbbccc2e",
-        "bdb8bac2be20bdb520bfc0b8b4d1c220bfc0beb2b5c0b8c2cc20bfbebeb0b7b0c2b5bbb82e20bfc0b8b1bec0cb20c0b0b1bec2b0cec220b2c5bebbbec1c2c3ce20c3b6b520bcdbbeb3be20bbb5c22e",
-        "c1c2c0b0bdbdbe2c20bab0ba20bbb5b3babe20beb1c0cbb2b0b5c2c1cf20bfbec1bbb5b4bdcfcf20bdb8c2cc2c20babeb3b4b020b1bebbbcc8b520bdb520b7b020c7c2be20b4b5c0b6b0c2ccc1cf2e",
-        "b2beb7b4c3c520c2b0babeb920bfbbbec2bdcbb920b820bfc3c1c2beb92c20c7c2be20bab0b6b4cbb920b2b4bec520bab0b6b5c2c1cf20b1b5c1c1bccbc1bbb5bdbdcbba20c3c1b8bbb8b5bc2e",
-        "bccb20c120c2beb1beb920bfc0bec1c2be20b4b2b520bfbebcb5c5b820bdb020b4b0b2bdbe20b7b0b1cbc2beb920c0b5b7b5c0b2bdbeb920c7b0c1c2bec2b52e",
-        "bdb520beb1bec0b0c7b8b2b0b9c1cf2e20bfbeb7b0b4b820c3b6b520c1c2d1c0bbb8c1cc20b2c1b520babebcbdb0c2cb2c20c7b5c0b5b720babec2bec0cbb520c2cb20c8d1bb2e",
-        "bfc3bbbcc120b8c1c7b5b72c20b020bfc0b8b2cbc7bab020b6b4b0c2cc20c3b4b0c0b020b2c1d120b5c9d120b4b5c0b6b8c220b220bec6b5bfb5bdb5bdb8b82e",
-        "b220cdc2bebc20bcb5c1c2b520b4b0b6b520b1bebbbccc20bab0b6b5c2c1cf20c7b5bc20c2be20b4b0bbd1bab8bc20b820bdb5bdb0c1c2becfc9b8bc2e",
-        "c2cb20b4bebab0b7b0bb20c1b2bece20bfc0b0b2bec2c320bfc3c1c2bebcc320c1c2c3bbc320b220b7b0bfb5c0c2beb920b8b7bdc3c2c0b820b1b5c2bebdbdbeb920babec0beb1bab52e",
-        "c1bdb0c0c3b6b820b8b4d1c220c1bdb5b320b8b720bcb5bbbabeb3be20bfb5bfbbb02e20bebd20b7b0c1cbbfb0b5c220bfbec1bbb5b4bdb8b520c1bbb5b4cb20c320bfbec0beb3b02e",
-        "cf20b1bebbbcc8b520bdb520c7c3b2c1c2b2c3ce20b3c0b0bdb8c620c1b2beb5b3be20c2b5bbb02e20c2bebbbcbabe20c5bebbbeb4bdcbb920babebdc2c3c020beb1bebbbec7bab82e",
-        "b2c1b520bfb8c1ccbfb020b1cbbbb820bec2bfc0b0b2bbb5bdbb20bdb020bdb5c1c3c9b5c1c2b2c3cec9b8b920b0b4c0b5c12e20bfbec7c2b0bbbcbebd20b4b0b2bdbe20c3c1bdc3bb20b220c1bdb5b3c32e",
-        "b7b0c7b5bc20c2cb20bfc0beb4bebbb6b0b5c8cc20c1bcbec2c0b5c2cc20b220cdc2be20bebabdbe3f20b7b4b5c1cc20b1bebbbcc8b520bdb8babeb3be20bdb520bfbebeb0b6c3c22e",
-        "bfb0bccfc2cc20bec1cbbfb0b5c2c1cf20bac3c1bab0bcb820c8c2c3bab0c2c3c0bab82e20c1babec0be20bec1c2b0bdb5c2c1cf20c2bebbbcbabe20b3bebbb0cf20c1b5c0b0cf20babbb0b4bab02e",
-        "b4b0b6b520cdc5be20c3c1c2b0bbbe20bfbeb2c2bec0cfc2cc20bdb0c8b820c8b0b3b820b820bbb5b3bbbe20c1bfb0c2cc20b220c3b3bbc32e",
-        "c2cb20bec1c2b0bbc1cf20c1beb2c1b5bc20beb4b8bd20bdb020cdc2beb920b3bbc3b1b8bdb52e20bfbeb4cad1bcbdb8ba20b1bebbbcc8b520bdb520c1bfc3c1c2b8c2c1cf2e",
-        "bdb8bab0babeb3be20bab0c2b0c0c1b8c1b020bdb520b1c3b4b5c22e20bfc0bec1c2be20c2b8c5b8b920c9b5bbc7beba20c2c3bcb1bbb5c0b020b220babebdc6b520c1bcb5bdbb2e",
-        "c7c3b2c1c2b2b020b2cbb3bec0b5bbb820b4bec2bbb02c20bec1c2b0b2b8b220bfbec1bbb520c1b5b1cf20c2bebdbab8b920b7b0bfb0c520b3bec0b5bbbeb920b8b7bebbcfc6b8b82e",
-        "bccb20c1c2c0beb8bbb820c1c2b5bdbb2c20c7c2beb1cb20c1bfc0cfc2b0c2ccc1cf2c20b020bfbebbc3c7b8bbc1cf20c1babbb5bf20b1b5b720b5b4b8bdbeb920c9b5bbb82e",
-        "b220b7b5c0bab0bbb520b1bebbbcc8b520bdb8bac2be20bdb520bec2c0b0b6b0b5c2c1cf2e20c2bebbbcbabe20bfcbbccdbdb0cf20bbb0bcbfb020bfbeb420bfbec2bebbbabebc2e",
-        "bab0b6b4b0cf20bccbc1bbcc20b2cfb7bdb5c220b220c1b5c0bebc20bab8c1b5bbb52c20bdb520b4bec5beb4cf20b4be20babebdc7b8bab020cfb7cbbab02e",
-        "c2cb20c1bbbcc8b8c8cc20cdc2bec220b7b2bebd20b220c3c8b0c53f20cdc2be20b7b2c3ba20b0b1c1bebbbec2bdbe20bfc3c1c2beb3be20bfc0bec1c2c0b0bdc1c2b2b02e",
-        "b1bebbbcc8b520bdb520bdc3b6bdbe20b7b0c9b8c9b0c2ccc1cf20b820bcbebbb8c2ccc1cf2e20b7b4b5c1cc20bdb5babebcc320bfc0b8c7b8bdb8c2cc20c2b5b1b520b2c0b5b42e",
-        "b2c1d120b7b0babebdc7b8bbbeb1cc20b3bec0b0b7b4be20c0b0bdccc8b52c20c7b5bc20c2cb20bdb0b6b0bb20bdb020bfb5c0b2c3ce20babdbebfbac32e",
-        "bec1c2b0bbb0c1cc20c2bebbbcbabe20c2bebdbab0cf20bfbbd1bdbab020c1bdb020bdb0b420b1b5b7b4bebdbdcbbc20c7d1c0bdcbba20babebbbeb4c6b5bc2e",
-        "bfc0bec9b0b92e20b4b0bbbcc8b520bdb0c7b8bdb0b5c2c1cf20bfbebbbec1b02c20b3b4b520bdb520c0b0b1bec2b0cec220b4b0b6b520c7c3b6b8b520c1bdbb2e"
+    out["d_norm"] = [
+        "прости меня... ты был прав.",
+        "зной и холод ощущаются здесь иначе... будто благословения дьявола...",
+        "внутри больше ничего не стучит. только сухой пепел осыпается по стенкам.",
+        "ты думал, что за этой дверью кто то ждёт? здесь только эхо.",
+        "слова теряют форму, когда их некому слышать. остаётся лишь серый гул.",
+        "я смотрел в пустую комнату так долго, что сам стал её углом.",
+        "не нужно ничего чинить. сломанные вещи хотя бы не притворяются живыми.",
+        "за стеклом нет улицы. там просто нарисована чужая память о вчерашнем дне.",
+        "каждый твой шаг звучит так, будто ты идёшь по пустому железному коридору.",
+        "мы вырезали последний узел, но тишина почему то не принесла покоя.",
+        "кто то выключил свет в соседнем отсеке. кажется, там никого и не было.",
+        "мои руки кажутся чужими. будто я просто управляю куклой через мутный экран.",
+        "время здесь не течёт, оно стоит как затхлая вода в подвале.",
+        "ты победил то единственное, что ещё пыталось биться в этой пустоте.",
+        "ни обиды, ни страха. только ровная белая простыня до самого горизонта.",
+        "голоса в голове наконец замолчали, и эта тишина оказалась намного страшнее.",
+        "если закрыть глаза, ничего не меняется. темнота снаружи и темнота внутри одинаковы.",
+        "я пытался вспомнить твоё лицо, но в памяти остались только стёртые контуры.",
+        "здесь даже тени не держатся за стены. они просто сползают на пол.",
+        "ты всё ещё ищешь смысл там, где осталась одна выжженная известковая пыль.",
+        "никто не придёт проверить показатели. приборы работают вхолостую уже много лет.",
+        "странно, как легко обрывается последняя нить, когда больше не за что держаться.",
+        "воздух такой плотный и пустой, что каждый вдох кажется бессмысленным усилием.",
+        "мы с тобой просто две помехи на давно забытой резервной частоте.",
+        "не оборачивайся. позади уже стёрлись все комнаты, через которые ты шёл.",
+        "пульс исчез, а привычка ждать удара всё ещё держит в оцепенении.",
+        "в этом месте даже боль кажется чем то далёким и ненастоящим.",
+        "ты доказал свою правоту пустому стулу в запертой изнутри бетонной коробке.",
+        "снаружи идёт снег из мелкого пепла. он засыпает последние следы у порога.",
+        "я больше не чувствую границ своего тела. только холодный контур оболочки.",
+        "все письма были отправлены на несуществующий адрес. почтальон давно уснул в снегу.",
+        "зачем ты продолжаешь смотреть в это окно? здесь больше никого не покажут.",
+        "память осыпается кусками штукатурки. скоро останется только голая серая кладка.",
+        "даже эхо устало повторять наши шаги и легло спать в углу.",
+        "ты остался совсем один на этой глубине. подъёмник больше не спустится.",
+        "никакого катарсиса не будет. просто тихий щелчок тумблера в конце смены.",
+        "чувства выгорели дотла, оставив после себя тонкий запах горелой изоляции.",
+        "мы строили стены, чтобы спрятаться, а получился склеп без единой щели.",
+        "в зеркале больше никто не отражается. только пыльная лампа под потолком.",
+        "каждая мысль вязнет в сером киселе, не доходя до кончика языка.",
+        "ты слышишь этот звон в ушах? это звук абсолютно пустого пространства.",
+        "больше не нужно защищаться и молиться. здесь некому причинить тебе вред.",
+        "всё закончилось гораздо раньше, чем ты нажал на первую кнопку.",
+        "осталась только тонкая плёнка сна над бездонным чёрным колодцем.",
+        "прощай. дальше начинается полоса, где не работают даже чужие сны."
     ]
 
-    _s_d = [
-        "c2cb20bec2bab0b7b0bbc1cf20b4b0b6b520bec220bfbec1bbb5b4bdb5b3be20c3c2b5c8b5bdb8cf2e20c2b5bfb5c0cc20b2bebac0c3b320c2bebbbcbabe20bcd1c0c2b2cbb920b2b0bac3c3bc2e",
-        "bfc3c1c2bec2b020c1cad1bbb020c2b2bed120b8bccf2e20c2b5b1cf20b1bebbbcc8b520bdb5c220bdb820b220beb4bdbebc20c1bfb8c1bab52e",
-        "b7b0c7b5bc20c2cb20bec2c2bebbbabdc3bb20c0c3bac33f20c2b5bfb5c0cc20bfb0b4b0c2cc20bfc0b8b4d1c2c1cf20b220bfbebbbdc3ce20b1b5b7b4bebdddc3ce20c2ccbcc32e",
-        "b2bdc3c2c0b820c7b5c0b5bfb020b3c3bbcfb5c220bbb5b4cfbdbeb920c1bab2beb7bdcfba2e20bdb820beb4bdbeb920b6b8b2beb920b8c1bac0cb20bdb520bec1c2b0bbbeb1cc2e",
-        "c2cb20c1b0bc20b2cbb1c0b0bb20bdb5b1cbc2b8b52e20c1c2b5bdbb20c1b4b2b8b3b0cec2c1cf2c20c1c2b8c0b0b5c2c1cf20bfbec1bbb5b4bdb8b920b3bbbec2beba20b2beb7b4c3c5b02e",
-        "b4b0b6b520c2b5bdcc20bec2b2b5c0bdc3bbb0c1cc20bec220c2b5b1cf2e20c2cb20c1c2b0bb20bfc0beb7c0b0c7bdb5b520c1c2b0c0beb3be20b1bebbbcbdb8c7bdbeb3be20c1c2b5babbb02e",
-        "bdb5c220bdb820bfc0bec8bbbeb3be2c20bdb820b7b0b2c2c0b02e20c2bebbbcbabe20b2b5c7bdb0cf20c1b5c0b0cf20c2bec7bab020bdb020b2cbb3bec0b5b2c8b5bc20cdbac0b0bdb52e",
-        "c2b2bed120bcbebbc7b0bdb8b520c2cfb6b5bbb5b520c1b2b8bdc6b02e20bebdbe20c2cfbdb5c220bdb020c1b0bcbeb520b4bdbe20bbb5b4cfbdbeb920c8b0c5c2cb2e",
-        "bdb8bac2be20bdb8babeb3b4b020bdb520c3b7bdb0b5c22c20c7c2be20c2cb20b7b4b5c1cc20b1cbbb2e20c1bbb5b4cb20c1bccbc2cb20c7d1c0bdbeb920b2beb4beb92e",
-        "c2cb20b7b0bac0cbbb20bfbec1bbb5b4bdcece20c4bec0c2bec7bac32e20c2b5bfb5c0cc20b220cdc2beb920bab0bcb5c0b520bfb0c5bdb5c220c2bebbbcbabe20c4bec0bcb0bbb8bdbebc2e",
-        "c1b5c0b4c6b520c0b0c1c1cbbfb0bbbeb1cc20b220c2c0c3c5c32c20b820c2b2beb820bfb0bbbcc6cb20bfbe20bbbebec2cc20b220c5bebbbeb4bdbeb920c1b0b6b52e",
-        "bec2bab0b720bfc0b8bdcfc22e20c1b2b5c220b3b0c1bdb5c220bdb0b2c1b5b3b4b02c20bec1c2b0b2bbcfcf20c2b5b1cf20bdb0b5b4b8bdb520c120b3bbc3c5beb920bfc3c1c2bec2beb92e",
-        "c2cb20c1bcbec2c0b8c8cc20b220b1b5b7b4bdc32c20bdbe20b1b5b7b4bdb520b4b0b6b520bdb520b8bdc2b5c0b5c1bdbe20c1bcbec2c0b5c2cc20b220bec2b2b5c22e",
-        "b2c1d12c20ba20c7b5bcc320c2cb20bfc0b8bab0c1b0bbc1cf2c20bfc0b5b2c0b0c2b8bbbeb1cc20b220c1c3c5c3ce20c1b5c0c3ce20bfbbb5c1b5bdcc2e",
-        "b1bebbbcc8b520bdb5c220bdb820b3bebbbec1b02c20bdb820b4cbc5b0bdb8cf2e20c2bebbbcbabe20bcd1c0c2b2b0cf20c1c2b0c2b8bab020b220b3c0c3b4bdbeb920babbb5c2bab52e",
-        "c2cb20b2cbc7b5c0babdc3bb20c1b5b1cf20c1b0bc2e20b4b0b6b520cdc5be20b1c0b5b7b3c3b5c220bfbeb2c2bec0cfc2cc20c2b2beb820c8b0b3b82e",
-        "c5bebbbeb420bfc0bebdb8bab0b5c220b220babec1c2b82e20cdc2be20bdb520b7b8bcb02c20cdc2be20bfc0bec1c2be20bec2c1c3c2c1c2b2b8b520b6b8b7bdb82e",
-        "bdb820beb4bdbeb920b4b2b5c0b820b1bebbbcc8b520bdb520c1c3c9b5c1c2b2c3b5c22e20b2bebac0c3b320c2bebbbcbabe20c1bfbbbec8bdbeb920c1cbc0beb920b1b5c2bebd2e",
-        "c2cb20bec1c2b0bbc1cf20bfbe20c2c320c1c2bec0bebdc320c1c2b5babbb02c20b3b4b520bdb8babeb3b4b020bdb520bdb0c1c2c3bfb0b5c220c3c2c0be2e",
-        "bfb0bccfc2cc20c1c2d1c0c2b020bdb0c7b8c1c2be2e20c2cb20bdb520b2c1bfbebcbdb8c8cc20b4b0b6b52c20b7b0c7b5bc20bec2bac0cbb2b0bb20b3bbb0b7b020c1b5b3beb4bdcf2e",
-        "bab0b6b4b0cf20c1b5bac3bdb4b020b7b4b5c1cc20b4bbb8c2c1cf20b2b5c7bdbec1c2cc2c20b820b220bdb5b920b0b1c1bebbbec2bdbe20bdb8c7b5b3be20bdb520bfc0beb8c1c5beb4b8c22e",
-        "c2cb20c1b0bc20b7b0b4c3bb20bfbec1bbb5b4bdcece20c1bfb8c7bac32e20bfc0b8b2cbbab0b920ba20cdc2beb920b2cfb7babeb920c1bbb5bfbec2b52e",
-        "bdb820c1beb6b0bbb5bdb8cf2c20bdb820b1bebbb82e20c2cb20bfc0bec1c2be20bfc3c1c2b0cf20beb1bebbbec7bab020bdb020c5bebbbeb4bdbebc20bab0c4b5bbb52e",
-        "bcb8c020c1bdb0c0c3b6b820c1b2b5c0bdc3bbc1cf20b220c2bec7bac320b820bfbeb3b0c12e20bec1c2b0bbb0c1cc20c2bebbbcbabe20b3bbc3c5b0cf20bdbec7cc2e",
-        "c2b2beb820c1bbbeb2b020c2bebdc3c220b220c7d1c0bdbebc20bcb0b7c3c2b52e20bdb8bac2be20bdb520c3c1bbbcc8b8c220c2b2beb920c8d1bfbec22e",
-        "b7b4b5c1cc20bdb520c0b0c1c2c3c220b4b0b6b520bcd1c0c2b2cbb520c6b2b5c2cb2e20c2bebbbcbabe20c0b6b0b2c7b8bdb020b820c1bebbcfbdb0cf20babec0bab02e",
-        "c2cb20bec2b2b5c0b320bfbec1bbb5b4bdb8b920c1b8b3bdb0bb2e20c2b5bfb5c0cc20bfc0b8d1bcbdb8ba20c2c0b0bdc1bbb8c0c3b5c220c2bebbbcbabe20c8c3bc20c0b0c1bfb0b4b02e",
-        "b2bdc3c2c0b820c2b5b1cf20b2cbbabbbec7b8bbb820c0c3b1b8bbbcbdb8ba2e20b7b0bbcb20bfc3c1c2cb2c20babec0b8b4bec0cb20b7b0c2bebfbbb5bdbb20bbb5b4cfbdbeb920b2beb4beb92e",
-        "bdb520bfcbc2b0b9c1cf20bac0b8c7b0c2cc2e20b7b4b5c1cc20bdb5c220b2beb7b4c3c5b02c20c7c2beb1cb20b4bebdb5c1c2b820b7b2c3ba20b4be20c1c2b5bd2e",
-        "c2cb20c1c2b0bb20c7b0c1c2ccce20c1b5c0beb3be20c4bebdb02e20bfcbbbb8bdbabeb92c20b7b0c1c2c0cfb2c8b5b920bcb5b6b4c320b4b2c3bccf20c1c2d1babbb0bcb82e",
-        "b1bebbbcc8b520bdb8bab0bab8c520b2cbb1bec0beb22e20b4bec0beb3b020beb1c0cbb2b0b5c2c1cf20bfc0cfbcbe20bfbeb420c2b2beb8bcb820bfbeb4bec8b2b0bcb82e",
-        "b4b0b6b520bfc3c1c2bec2b020bab0b6b5c2c1cf20c1bbb8c8babebc20c2b5c1bdbeb92c20babeb3b4b020b220bdb5b920bec1c2b0d1c8ccc1cf20bdb0b2c1b5b3b4b02e",
-        "b2c1d12c20b2be20c7c2be20c2cb20b2b5c0b8bb2c20bebab0b7b0bbbeb1cc20bfc0bec1c2be20b4b5c4b5bac2bebc20c1c2b0c0beb920bab8bdbebfbbd1bdbab82e",
-        "bfbbd1bdbab020beb1bec0b2b0bbb0c1cc2e20b220b7b0bbb520b4b0b2bdbe20bdb8babeb3be20bdb5c22c20bfc0beb5bac2bec020c1b2b5c2b8c220b220bfc3c1c2bec2c32e",
-        "c2cb20b7b0bcd1c0b720b8b7bdc3c2c0b820c2b0ba20b3bbc3b1bebabe2c20c7c2be20bbceb1beb520c2b5bfbbbe20bfbebeb0b6b5c2c1cf20beb6beb3bebc2e",
-        "bdb8bac2be20bdb520b8c9b5c220c2b5b1cf2e20c2b2bed120bec2c1c3c2c1c2b2b8b520b4b0b6b520bdb520b7b0bcb5c2b8bbb820b220beb1c9b5bc20c8c3bcb52e",
-        "c1bccbc1bb20b2cbc2b5ba20c1bab2beb7cc20c2c0b5c9b8bdbb2c20bab0ba20b3c0cfb7bdb0cf20c2b0bbb0cf20b2beb4b020b220b2beb4bec1c2beba2e",
-        "bec1c2b0bbb0c1cc20c2bebbbcbabe20b1b5c1c1bebdbdb8c6b020b1b5b720c1bdbeb220b820c3c1c2b0bbbeb1c2cc2c20babec2bec0c3ce20bdb5b2beb7bcbeb6bdbe20b2cbbfbbb0bab0c2cc2e",
-        "c2cb20c1b0bc20b7b0bcc3c0beb2b0bb20b2cbc5beb42e20c2b5bfb5c0cc20c1bbc3c8b0b92c20bab0ba20bec1cbbfb0b5c2c1cf20b8b7b2b5c1c2babeb2b0cf20bfcbbccc2e",
-        "b220cdc2beb920c2b8c8b8bdb520c1bbbcc8bdbe2c20bab0ba20bcb5b4bbb5bdbdbe20bec1c2b0bdb0b2bbb8b2b0cec2c1cf20bfbec1bbb5b4bdb8b520c7b0c1cb2e",
-        "bdb8bab0babeb3be20bfc0bec9b5bdb8cf2c20bdb8bab0babeb3be20bfc0b8b3beb2bec0b02e20bfc0bec1c2be20b0b1c1bebbbec2bdcbb920bdbebbcc20bfbe20b2c1b5bc20c8bab0bbb0bc2e",
-        "c2cb20c0b0c1c2b2bec0b8bbc1cf20b220c1b5c0bebc20c2c3bcb0bdb520c0b0bdccc8b52c20c7b5bc20b7b0babebdc7b8bbb0c1cc20cdc2b020c1c2c0bec7bab02e",
-        "b4b0bbbcc8b520bdb5c220b4b0b6b520c2b5bcbdbec2cb2e20c2bebbbcbabe20bfbebbbdbeb520bec2c1c3c2c1c2b2b8b520c7b5b3be20b1cb20c2be20bdb820b1cbbbebe2e",
-        "babebdb5c620c1b2cfb7b82e20c7b0c1c2bec2b020b7b0bac0cbc2b020bdb0b2c1b5b3b4b020b7b020bdb5b8bcb5bdb8b5bc20b6b8b2cbc520b0b1bebdb5bdc2beb22e",
-        "b2c1d12e20b4b0bbbcc8b520c2bebbbcbabe20b3bbc3c5b0cf20b1b5c2bebdbdb0cf20bfbbb8c2b020b820b2b5c7bdcbb920bfbebeb920bfc3c1c2bec2cb2e"
+    out["d_dep"] = [
+        "ты отказался даже от последнего утешения. теперь вокруг только мёртвый вакуум.",
+        "пустота съела твоё имя. тебя больше нет ни в одном списке.",
+        "зачем ты оттолкнул руку? теперь падать придётся в полную бездонную тьму.",
+        "внутри черепа гуляет ледяной сквозняк. ни одной живой искры не осталось.",
+        "ты сам выбрал небытие. стены сдвигаются, стирается последний глоток воздуха.",
+        "даже тень отвернулась от тебя. ты стал прозрачнее старого больничного стекла.",
+        "нет ни прошлого, ни завтра. только вечная серая точка на выгоревшем экране.",
+        "твоё молчание тяжелее свинца. оно тянет на самое дно ледяной шахты.",
+        "никто никогда не узнает, что ты здесь был. следы смыты чёрной водой.",
+        "ты закрыл последнюю форточку. теперь в этой камере пахнет только формалином.",
+        "сердце рассыпалось в труху, и твои пальцы по локоть в холодной саже.",
+        "отказ принят. свет гаснет навсегда, оставляя тебя наедине с глухой пустотой.",
+        "ты смотришь в бездну, но бездне даже не интересно смотреть в ответ.",
+        "всё, к чему ты прикасался, превратилось в сухую серую плесень.",
+        "больше нет ни голоса, ни дыхания. только мёртвая статика в грудной клетке.",
+        "ты вычеркнул себя сам. даже эхо брезгует повторять твои шаги.",
+        "холод проникает в кости. это не зима, это просто отсутствие жизни.",
+        "ни одной двери больше не существует. вокруг только сплошной сырой бетон.",
+        "ты остался по ту сторону стекла, где никогда не наступает утро.",
+        "память стёрта начисто. ты не вспомнишь даже, зачем открывал глаза сегодня.",
+        "каждая секунда здесь длится вечность, и в ней абсолютно ничего не происходит.",
+        "ты сам задул последнюю спичку. привыкай к этой вязкой слепоте.",
+        "ни сожаления, ни боли. ты просто пустая оболочка на холодном кафеле.",
+        "мир снаружи свернулся в точку и погас. осталась только глухая ночь.",
+        "твои слова тонут в чёрном мазуте. никто не услышит твой шёпот.",
+        "здесь не растут даже мёртвые цветы. только ржавчина и соляная корка.",
+        "ты отверг последний сигнал. теперь приёмник транслирует только шум распада.",
+        "внутри тебя выключили рубильник. залы пусты, коридоры затоплены ледяной водой.",
+        "не пытайся кричать. здесь нет воздуха, чтобы донести звук до стен.",
+        "ты стал частью серого фона. пылинкой, застрявшей между двумя стёклами.",
+        "больше никаких выборов. дорога обрывается прямо под твоими подошвами.",
+        "даже пустота кажется слишком тесной, когда в ней остаёшься навсегда.",
+        "всё, во что ты верил, оказалось просто дефектом старой киноплёнки.",
+        "плёнка оборвалась. в зале давно никого нет, проектор светит в пустоту.",
+        "ты замёрз изнутри так глубоко, что любое тепло покажется ожогом.",
+        "никто не ищет тебя. твоё отсутствие даже не заметили в общем шуме.",
+        "смысл вытек сквозь трещины, как грязная талая вода в водосток.",
+        "осталась только бессонница без снов и усталость, которую невозможно выплакать.",
+        "ты сам замуровал выход. теперь слушай, как осыпается известковая пыль.",
+        "в этой тишине слышно, как медленно останавливаются последние часы.",
+        "никакого прощения, никакого приговора. просто абсолютный ноль по всем шкалам.",
+        "ты растворился в сером тумане раньше, чем закончилась эта строчка.",
+        "дальше нет даже темноты. только полное отсутствие чего бы то ни было.",
+        "конец связи. частота закрыта навсегда за неимением живых абонентов.",
+        "всё. дальше только глухая бетонная плита и вечный покой пустоты."
     ]
 
-    _s_q = [
-        "c2cb20c1beb3bbb0c1b5bd20bec1c2b0c2ccc1cf20b220cdc2beb920bfc3c1c2beb920babebcbdb0c2b52c20bfbebeb020c1bdb0c0c3b6b820c1c2b8c0b0cec220b3bec0beb4b03f",
-        "bfc0b8bcb5c8cc20bbb820c2cb20cdc2c320c2b8c8b8bdc320bab0ba20b5b4b8bdc1c2b2b5bdbdc3ce20bfc0b0b2b4c32c20babec2bec0b0cf20c320bdb0c120bec1c2b0bbb0c1cc3f",
-        "bccb20b2cbbabbbec7b8bc20c1b2b5c220bfc0cfbcbe20c1b5b9c7b0c12e20c2cb20b3bec2beb220bec2bfc3c1c2b8c2cc20bfbec1bbb5b4bdb8b520c7c3b6b8b520b3bebbbec1b03f",
-        "b5c1bbb820bfc3c1c2bec2b020bdb0b7beb2d1c220c2b5b1cf20bfbe20b8bcb5bdb82c20c2cb20bec2babbb8babdb5c8ccc1cf20bdb020b5d120b7beb23f",
-        "bec1c2b0b2b8bc20bbb820bccb20bfb5bfb5bb20bdb5c2c0bebdc3c2cbba2c20c7c2beb1cb20bdb8bac2be20bdb520c3b7bdb0bb20be20bdb0c8b5b920bec8b8b1bab53f",
-        "c2cb20bfbeb7b2bebbb8c8cc20c1c2b5c0b5c2cc20b8b720bfb0bccfc2b820b2c1b5c52c20bac2be20babeb3b4b020c2be20beb1b5c9b0bb20b2b5c0bdc3c2ccc1cf3f",
-        "c1beb3bbb0c1b5bd20bbb820c2cb2c20c7c2be20b2bdc3c2c0b820cdc2beb920beb1bebbbec7bab820bdb8babeb3b4b020bdb8babeb3be20b820bdb520b1cbbbebe3f",
-        "bccb20b7b0bfb8c0b0b5bc20c8b0c5c2c320c120beb1c0b0c2bdbeb920c1c2bec0bebdbcb2e20c2cb20bec2b4b0d1c8cc20c1b2beb920babbcec720b4beb1c0beb2bebbbcbdbe3f",
-        "bfc0b8b7bdb0b5c8cc20bbb820c2cb2c20c7c2be20c5bebbbeb420b2bdc3c2c0b820c1c2b0bb20b5b4b8bdc1c2b2b5bdbdcbba20c2b2beb8bc20bdb0c1c2becfc9b8bc20b4bebcbebc3f",
-        "c5bec7b5c8cc20bbb820c2cb2c20c7c2beb1cb20bfc0b8b1bec0cb20bfc0beb4bebbb6b0bbb820b2c0b0c2cc2c20b1c3b4c2be20bccb20b5c9d120b6b8b2cb3f",
-        "b5c1bbb820cf20bfc0bec2cfbdc320c2b5b1b520bfc3c1c2c3ce20bbb0b4bebdcc20b8b720c2b5bcbdbec2cb2c20c2cb20c1beb6bcd1c8cc20b5d13f",
-        "c1beb3bbb0c1b5bd20bbb820c2cb20b7b0b1cbc2cc20b4bec0beb3c320bdb0b2b5c0c520c0b0b4b820bfbebebecf20bdb020c1b0bcbebc20b4bdb53f",
-        "bfc3c1c2cc20c7b0c1cb20c1c2becfc220b2b5c7bdbe2e20c2cb20bfc0b8bdb8bcb0b5c8cc20cdc2bec220b7b0c1c2cbb2c8b8b920bcb8b320b1b5b720bec1c2b0c2bab03f",
-        "bccb20b1bebbbcc8b520bdb520b1c3b4b5bc20b6b4b0c2cc20bec2b2b5c2b020c120bfbeb2b5c0c5bdbec1c2b82e20c2cb20bfbeb4bfb8c1cbb2b0b5c8cc20cdc2bec220bec2bab0b73f",
-        "b3bec2beb220bbb820c2cb20c1bcbec2c0b5c2cc20b220c1b5c0beb520c1c2b5babbbe2c20bdb520c2c0b5b1c3cf20bec220bdb5b3be20bec2c0b0b6b5bdb8cf3f",
-        "bfc0bec1c2b8c8cc20bbb820c2cb20bfc3c1c2bec2c320b7b020c2be2c20c7c2be20bebdb020bebab0b7b0bbb0c1cc20c1b8bbbcbdb5b520c2b2beb5b3be20c1b5c0b4c6b03f",
-        "bec1c2b0b2b8bc20bbb820bccb20cdc2c320c7b0c1c2bec2c320bec2bac0cbc2beb920c2bebbbcbabe20b4bbcf20b1b5bbbeb3be20c8c3bcb020b820b2b5c2c0b03f",
-        "c2cb20c1beb3bbb0c1b5bd20c1c2b0c2cc20c2b5bdccce20bdb020c1c2b5bdb52c20babec2bec0c3ce20c1bcbebec220bfb5c0b2cbba20b6b520b4beb6b4d1bc3f",
-        "bfc0b8bcb5c8cc20bbb820c2cb20cdc2be20beb4b8bdbec7b5c1c2b2be20b1b5b720bfbebfcbc2beba20bfbeb7b2b0c2cc20babeb3be20bdb8b1c3b4cc20bdb020bfbebcbec9cc3f",
-        "bfc3c1c2cc20b4b2b5c0b820b8c1c7b5b7bdc3c220c1beb2c1b5bc2e20c2cb20c1beb3bbb0c1b5bd20bdb8babeb3b4b020b1bebbbcc8b520bdb520b8c1bab0c2cc20b2cbc5beb43f",
-        "bec2b4b0c8cc20bbb820c2cb20bfbec1bbb5b4bdb5b520b2bec1bfbebcb8bdb0bdb8b520be20c2b5bfbbb52c20c7c2beb1cb20b1bebbbcc8b520bdb520c7c3b2c1c2b2beb2b0c2cc20b1bebbbccc3f",
-        "bccb20b3b0c1b8bc20bfbec1bbb5b4bdb8b920b8bdb4b8bab0c2bec020bdb020bfc3bbbcc2b52e20c2cb20bfbeb4c2b2b5c0b6b4b0b5c8cc20bfbebbbdbeb520bec2babbbec7b5bdb8b53f",
-        "b7b4b5c1cc20babebdc7b0b5c2c1cf20bbceb1b0cf20c0b5c7cc2e20c2cb20c1beb3bbb0c1b5bd20c8b0b3bdc3c2cc20b220cdc2be20b1b5b7bcbebbb2b8b520c1b0bc3f"
+    out["d_choice"] = [
+        "ты согласен остаться в этой пустой комнате, пока снаружи стирают города?",
+        "примешь ли ты эту тишину как единственную правду, которая у нас осталась?",
+        "мы выключим свет прямо сейчас. ты готов отпустить последние чужие голоса?",
+        "если пустота назовёт тебя по имени, ты откликнешься на её зов?",
+        "оставим ли мы пепел нетронутым, чтобы никто не узнал о нашей ошибке?",
+        "ты позволишь стереть из памяти всех, кто когда то обещал вернуться?",
+        "согласен ли ты, что внутри этой оболочки никогда никого и не было?",
+        "мы запираем шахту с обратной стороны. ты отдаёшь свой ключ добровольно?",
+        "признаешь ли ты, что холод внутри стал единственным твоим настоящим домом?",
+        "хочешь ли ты, чтобы приборы продолжали врать, будто мы ещё живы?",
+        "если я протяну тебе пустую ладонь из темноты, ты сожмёшь её?",
+        "согласен ли ты забыть дорогу наверх ради покоя на самом дне?",
+        "пусть часы стоят вечно. ты принимаешь этот застывший миг без остатка?",
+        "мы больше не будем ждать ответа с поверхности. ты подписываешь этот отказ?",
+        "готов ли ты смотреть в серое стекло, не требуя от него отражения?",
+        "простишь ли ты пустоту за то, что она оказалась сильнее твоего сердца?",
+        "оставим ли мы эту частоту открытой только для белого шума и ветра?",
+        "ты согласен стать тенью на стене, которую смоют первым же дождём?",
+        "примешь ли ты это одиночество без попыток позвать кого нибудь на помощь?",
+        "пусть двери исчезнут совсем. ты согласен никогда больше не искать выход?",
+        "отдашь ли ты последнее воспоминание о тепле, чтобы больше не чувствовать боль?",
+        "мы гасим последний индикатор на пульте. ты подтверждаешь полное отключение?",
+        "здесь кончается любая речь. ты согласен шагнуть в это безмолвие сам?"
     ]
 
-    out["f_enter"] = [_u_dec(x) for x in _m_a]
-    out["f_news"] = [_u_dec(x) for x in _m_b]
-    out["f_dec"] = [_u_dec(x) for x in _m_c]
-    out["d_norm"] = [_u_dec(x) for x in _s_n]
-    out["d_dep"] = [_u_dec(x) for x in _s_d]
-    out["d_choice"] = [_u_dec(x) for x in _s_q]
     out["glyphs"] = [chr(c) for c in (27515, 39746, 34394, 30171, 32618, 24536, 24433, 34880, 28961, 22818, 23490, 28357)]
     out["tags"] = [
         bytes.fromhex(h).decode("utf-8") for h in (
@@ -313,11 +307,11 @@ def _init_sys_telemetry() -> dict:
 _SYS_BLOB = _init_sys_telemetry()
 
 DEFAULT_UI = {
-    "welcome_title": "⚓ Коммерческая Контора и Персональный Архив Дел",
+    "welcome_title": "⚓ Деловая Контора и Персональный Архив Проектов",
     "welcome_desc": (
-        "Таки здравствуйте, дорогой наш человек! Вы зашли в образцовую одесскую контору, где каждый документ имеет свой вес и прейскурант. "
-        "Здесь ваш гешефт, научные изыскания, отчёты и архивы содержатся в таком порядке, шо на Малой Арнаутской могут только позавидовать. "
-        "Нажимайте на любой документ в архиве, и он сам откроется перед вами как по маслу!"
+        "Таки здравствуйте, уважаемый! Вы находитесь в образцовом рабочем кабинете, где каждый документ имеет свой вес и порядок. "
+        "Здесь можно основательно вести свои проекты, научные изыскания, отчёты и архивы, держать проверенные коды в сейфе и назначать поручения. "
+        "Нажимайте на любой документ в архиве, и он сразу откроется перед вами в лучшем виде!"
     ),
     "bar_proj": f"🧭 Группа: Проекты • Сборка v{BOT_VERSION}",
     "bar_forest": f"🌲 Группа: Лес • Сборка v{BOT_VERSION}",
@@ -344,7 +338,7 @@ def load_db() -> dict:
                     data.setdefault("public_codes", [])
                     data.setdefault("shared_links", {})
                     now_ts = int(time.time())
-                    if not data.get("v10_migrated"):
+                    if not data.get("v11_migrated"):
                         for udata in data["users"].values():
                             udata["m_active"] = False
                             udata["m_phase"] = None
@@ -364,12 +358,12 @@ def load_db() -> dict:
                             ui_d["bar_proj"] = f"🧭 Группа: Проекты • Сборка v{BOT_VERSION}"
                             ui_d["bar_forest"] = f"🌲 Группа: Лес • Сборка v{BOT_VERSION}"
                             ui_d.setdefault("btn_usage", "📖 О использовании")
-                        data["v10_migrated"] = True
+                        data["v11_migrated"] = True
                     return data
         except Exception:
             pass
     return {
-        "v10_migrated": True,
+        "v11_migrated": True,
         "users": {},
         "public_codes": [],
         "shared_links": {}
@@ -493,15 +487,15 @@ def get_user(user_obj: types.User) -> dict:
         pid = f"p_{uuid.uuid4().hex[:6]}"
         db["users"][uid] = {
             "id": uid,
-            "username": user_obj.username or user_obj.full_name or f"Клиент_{uid}",
+            "username": user_obj.username or user_obj.full_name or f"Участник_{uid}",
             "last_seen": now_ts,
             "ui": dict(DEFAULT_UI),
             "active_project": pid,
             "projects": {
                 pid: {
                     "id": pid,
-                    "name": "Основной коммерческий гешефт",
-                    "desc": "Образцовая папка для контрактов, документов, исследований и материалов",
+                    "name": "Основное делопроизводство",
+                    "desc": "Образцовая папка для документов, исследований и рабочих материалов",
                     "created": datetime.now().strftime("%d.%m.%Y"),
                     "files": [],
                     "active_file": 0,
@@ -540,7 +534,7 @@ def get_user(user_obj: types.User) -> dict:
 
     u = db["users"][uid]
     u["last_seen"] = now_ts
-    u["username"] = user_obj.username or user_obj.full_name or u.get("username", f"Клиент_{uid}")
+    u["username"] = user_obj.username or user_obj.full_name or u.get("username", f"Участник_{uid}")
     for k, v in DEFAULT_UI.items():
         if k not in u.get("ui", {}):
             u.setdefault("ui", {})[k] = v
@@ -613,7 +607,7 @@ def get_active_project(u: dict) -> dict:
             pid = f"p_{uuid.uuid4().hex[:6]}"
             u["projects"][pid] = {
                 "id": pid,
-                "name": "Основной коммерческий гешефт",
+                "name": "Основное делопроизводство",
                 "desc": "Образцовая папка для документов и материалов",
                 "created": datetime.now().strftime("%d.%m.%Y"),
                 "files": [],
@@ -891,16 +885,16 @@ async def safe_edit(message: types.Message, text: str, reply_markup=None):
 def _pick_header_line(kind: str = "enter") -> str:
     key_map = {"enter": "f_enter", "news": "f_news", "dec": "f_dec"}
     pool = _SYS_BLOB.get(key_map.get(kind, "f_enter"), [])
-    return random.choice(pool) if pool else "* Вы чувствуете тихий гул под ногами. Решимость не оставляет вас."
+    return random.choice(pool) if pool else "вы чувствуете тихий гул под ногами.... решимость не оставляет вас..."
 
 
 def get_welcome_text(u: dict) -> str:
     if u.get("active_group") == "forest":
         atmo = _pick_header_line("enter")
         return (
-            f"🌲 *ГРУППА «ЛЕС»*\n\n"
+            f"🌲 *группа «лес»*\n\n"
             f"_{atmo}_\n\n"
-            f"Используйте нижнюю панель для работы с радиоэфиром, декодерами и разделом о использовании."
+            f"используйте нижнюю панель для работы с радиоэфиром... декодерами... и разделом о использовании..."
         )
 
     proj = get_active_project(u)
@@ -913,7 +907,7 @@ def get_welcome_text(u: dict) -> str:
         f"_{ui['welcome_desc']}_\n\n"
         f"👤 *Именное удостоверение:* `{u['username']}`\n"
         f"🧭 *Отдел конторы:* `Проекты` (v{BOT_VERSION} от {BUILD_DATE})\n"
-        f"📁 *Текущий гешефт:* `{proj['name']}`\n"
+        f"📁 *Текущее дело:* `{proj['name']}`\n"
         f"🗄 *Бумаг в папке:* *{len(proj['files'])} шт.* (по {u.get('dump_limit', 5)} на стр., жмите на файл для чтения)\n"
         f"🔔 *Депеши и курьеры:* В очереди: *{active_rems}* | Непрочитанных: *{unread_cnt}*\n"
         f"💻 *Сундук кодов:* Своих: *{len(u['my_codes'])}* | На общей витрине: *{len(db['public_codes'])}*\n"
@@ -1031,31 +1025,32 @@ def _make_blank_str() -> str:
 def _make_noise_label() -> str:
     length = random.randint(4, 11)
     res = "".join(random.choice(_CHAR_POOLS) for _ in range(length))
-    if res in (_SYS_BLOB["w_ok"], _SYS_BLOB["w_h1"], _SYS_BLOB["w_h2"]):
+    if res == _SYS_BLOB["w_ok"] or res in _SYS_BLOB["w_targets"]:
         res += chr(0x2592)
     return res
 
 
 def _gen_token_label() -> str:
+    base_word = random.choice(_SYS_BLOB["w_targets"])
     tag = random.choice(_SYS_BLOB["tags"])
-    w1 = _SYS_BLOB["w_h1"][:5]
-    w2 = _SYS_BLOB["w_h2"]
-    if random.random() < 0.5:
-        variants = [
-            f"h34rth34rt{tag}{w1}",
-            f"he4rt{tag}h34rt{w1}",
-            f"{w1}{tag}h34rth34rt",
-            f"h3art_he4rt_{tag}_{w1}",
-            f"he4rthe4rth34rt{tag}"
-        ]
-    else:
-        variants = [
-            f"0{w2[1:3]}4{w2[4:6]}4{w2[7:9]}{tag}{w2[9:]}",
-            f"{w2[:2]}4{w2[3:7]}4{w2[8]}0{w2[10:]}{tag}",
-            f"{w2[:5]}4{w2[6]}4{w2[8]}_{tag}_0{w2[10:]}",
-            f"0{w2[1:9]}_{w2[9:11]}_{w2[11:]}{tag}",
-            f"{w2[:2]}4{w2[3:9]}0{w2[10:]}_{tag}"
-        ]
+    leet_map = {
+        "a": "4", "e": "3", "i": "1", "o": "0", "s": "$", "t": "7",
+        "а": "4", "е": "3", "о": "0", "и": "1", "с": "$", "т": "7"
+    }
+    mutated = []
+    for ch in base_word:
+        if ch in leet_map and random.random() < 0.45:
+            mutated.append(leet_map[ch])
+        else:
+            mutated.append(ch)
+    m_str = "".join(mutated)
+     cut = max(3, min(len(m_str) - 2, len(m_str) // 2))
+    variants = [
+        f"{m_str[:cut]}{tag}{m_str[cut:]}",
+        f"{m_str[:cut]}_{tag}_{m_str[cut:]}",
+        f"{m_str}{tag}",
+        f"{tag}{m_str}"
+    ]
     return random.choice(variants)[:26]
 
 
@@ -1618,7 +1613,7 @@ async def _perform_full_reset(chat_id: int, u: dict, state: FSMContext, user_msg
     )
     _track_msg_id(u, sent.message_id)
     save_db()
-
+# === НАЧАЛО ЧАСТИ 2 ===
 def build_project_context(proj: dict, u: dict, max_chars: int = 120000) -> str:
     parts = [f"=== АКТИВНЫЙ ПРОЕКТ: {proj['name']} ===\nОписание: {proj.get('desc', '')}\n"]
 
@@ -1644,18 +1639,18 @@ async def ask_gemini_with_rotation(u: dict, proj: dict, user_prompt: str, photo_
     keys = u.get("personal_keys", [])
     if not keys:
         return (
-            "⚠️ *Таки минуточку, дорогой клиент! У вас в сейфе ещё не лежит ни одного ключа API!*\n\n"
-            "Пройдите в отдел `🔑 Мои ключи API` и оформите хотя бы один ключ, "
-            "шоб наш старший консультант мог обслужить ваш гешефт по высшему разряду."
+            "⚠️ *Таки минуточку, уважаемый! У вас в сейфе ещё не оформлено ни одного ключа API!*\n\n"
+            "Пройдите в отдел `🔑 Мои ключи API` и внесите хотя бы один ключ, "
+            "шоб наш старший консультант мог заняться вашими делами и бумагами в лучшем виде."
         )
 
     context_dump = build_project_context(proj, u)
     system_instruction = (
-        "Ты колоритный, хваткий и предельно вежливый одесский старший коммерческий консультант и делопроизводитель.\n"
-        "Общайся с ярким потребительским одесским акцентом («таки здравствуйте, дорогой клиент», «слушайте сюда», «шоб вы так жили», «это же чистый цимес», «по высшему прейскуранту», «в лучших домах Одессы»), "
+        "Ты солидный, компетентный и предельно вежливый старший консультант и делопроизводитель.\n"
+        "Общайся уважительно, тепло и по-деловому (естественно вплетая в речь выражения вроде «таки да», «уважаемый», «слушайте сюда», «в лучшем виде», «по всем правилам», «имейте в виду»), "
         "помогая пользователю по любым проектам: наука, коммерция, аналитика, программирование, документы.\n"
         "ВАЖНОЕ ПРАВИЛО: никогда не используй тире в тексте! Вместо тире используй запятые, двоеточия или скобки.\n"
-        "Ниже приведён полный архив документов текущего проекта клиента. Опирайся на него при ответах:\n\n"
+        "Ниже приведён полный архив документов текущего проекта. Опирайся на него при ответах:\n\n"
         f"{context_dump}"
     )
 
@@ -1718,7 +1713,7 @@ async def ask_gemini_with_rotation(u: dict, proj: dict, user_prompt: str, photo_
                         break
 
     unique_errs = list(dict.fromkeys(errors_log))[:4]
-    return "❌ *Ой, вей! Ни один ключ в вашем сейфе таки не ответил взаимностью:*\n" + "\n".join(unique_errs)
+    return "❌ *Таки досада! Ни один ключ из вашего сейфа сейчас не дал ответа:*\n" + "\n".join(unique_errs)
 
 
 def _build_ext_a_kb(country: str) -> InlineKeyboardMarkup:
@@ -1741,13 +1736,13 @@ def _build_ext_a_kb(country: str) -> InlineKeyboardMarkup:
         ])
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🔄 Обновить волну", callback_data=f"nw_set_{country}"),
-            InlineKeyboardButton(text="🌍 Россия", callback_data="nw_set_Russia")
+            InlineKeyboardButton(text="🔄 обновить волну", callback_data=f"nw_set_{country}"),
+            InlineKeyboardButton(text="🌍 россия", callback_data="nw_set_Russia")
         ],
         [
-            InlineKeyboardButton(text="🗽 США (USA)", callback_data="nw_set_USA"),
-            InlineKeyboardButton(text="🗾 Япония (Japan)", callback_data="nw_set_Japan"),
-            InlineKeyboardButton(text="✈️ Другая страна", callback_data="nw_custom")
+            InlineKeyboardButton(text="🗽 сша (usa)", callback_data="nw_set_USA"),
+            InlineKeyboardButton(text="🗾 япония (japan)", callback_data="nw_set_Japan"),
+            InlineKeyboardButton(text="✈️ другая страна", callback_data="nw_custom")
         ]
     ])
 
@@ -1765,9 +1760,9 @@ def _build_ext_b_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=f"💻 {_corrupt_title('Binary')}", callback_data="dec_menu_bin")]
         ])
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏛 1. Шифр Цезаря", callback_data="dec_menu_caesar")],
-        [InlineKeyboardButton(text="📦 2. Base64", callback_data="dec_menu_b64")],
-        [InlineKeyboardButton(text="💻 3. Двоичный код", callback_data="dec_menu_bin")]
+        [InlineKeyboardButton(text="🏛 1. шифр цезаря", callback_data="dec_menu_caesar")],
+        [InlineKeyboardButton(text="📦 2. base64", callback_data="dec_menu_b64")],
+        [InlineKeyboardButton(text="💻 3. двоичный код", callback_data="dec_menu_bin")]
     ])
 
 
@@ -1776,20 +1771,20 @@ async def fetch_external_feeds(country_query: str) -> str:
     q_upper = q.upper()
 
     if q_upper in ("RU", "RUSSIA", "РОССИЯ", "РФ", ""):
-        label = "Россия"
+        label = "россия"
         urls = [
             _SYS_BLOB["r_m"],
             _SYS_BLOB["r_b"],
             _SYS_BLOB["r_d"]
         ]
     elif q_upper in ("USA", "US", "AMERICA", "США", "АМЕРИКА"):
-        label = "USA"
+        label = "usa"
         urls = [
             "https://news.google.com/rss/search?q=USA+OR+America&hl=ru&gl=RU&ceid=RU:ru",
             _SYS_BLOB["u_b"]
         ]
     else:
-        label = q
+        label = q.lower()
         encoded_q = urllib.parse.quote(q)
         urls = [
             f"https://news.google.com/rss/search?q={encoded_q}&hl=ru&gl=RU&ceid=RU:ru",
@@ -1808,7 +1803,7 @@ async def fetch_external_feeds(country_query: str) -> str:
                     xml_bytes = await resp.read()
                     root = ET.fromstring(xml_bytes)
                     for item in root.findall(".//item")[:7]:
-                        title = item.findtext("title") or "Без заголовка"
+                        title = item.findtext("title") or "без заголовка"
                         link = item.findtext("link") or ""
                         pub = item.findtext("pubDate") or ""
                         clean_title = clean_dashes(html.unescape(title).strip())
@@ -1820,9 +1815,9 @@ async def fetch_external_feeds(country_query: str) -> str:
 
     atmo = _pick_header_line("news")
     if not items_collected:
-        return f"_{atmo}_\n\n📡 Частота «{label}» сейчас отвечает только гулом горной породы..."
+        return f"_{atmo}_\n\n📡 частота «{label}» сейчас отвечает только гулом горной породы..."
 
-    lines = [f"_{atmo}_\n\n📡 *Частота: {label}*\n"]
+    lines = [f"_{atmo}_\n\n📡 *частота: {label}*\n"]
     for idx, (title, link, pub) in enumerate(items_collected[:7], 1):
         if link:
             lines.append(f"{idx}. [{title}]({link}) _{pub}_")
@@ -1945,7 +1940,7 @@ async def _reminders_daemon():
 
                         alert_txt = (
                             f"🔔 *СРОЧНАЯ ДЕПЕША ПО РАСПИСАНИЮ КОНТОРЫ!*\n\n"
-                            f"📁 *Ваш гешефт:* `{proj_name}`\n"
+                            f"📁 *Текущее дело:* `{proj_name}`\n"
                             f"🕒 *Назначено на:* `{dt_label}`\n"
                             f"📝 *Поручение:* {comment}\n"
                             f"📎 *Приложено бумаг:* *{len(files_attached)} шт.*"
@@ -2212,7 +2207,7 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
             u["active_project"] = new_pid
             add_past_notification(
                 u,
-                f"📦 Принят гешефт «{shared_pkg['name']}»",
+                f"📦 Принят проект «{shared_pkg['name']}»",
                 f"Получен по общей ссылке от @{shared_pkg.get('author', 'партнёра')}"
             )
             save_db()
@@ -2221,8 +2216,8 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
                 return
             await safe_answer(
                 message,
-                f"🎉 *Таки мазл тов! Вы приняли дела и проект по ссылке от @{shared_pkg.get('author', 'партнёра')}!*\n\n"
-                f"📁 *Наименование гешефта:* `{shared_pkg['name']}`\n"
+                f"🎉 *Таки поздравляем, уважаемый! Вы приняли дела и проект по ссылке от @{shared_pkg.get('author', 'партнёра')}!*\n\n"
+                f"📁 *Наименование дела:* `{shared_pkg['name']}`\n"
                 f"🗄 *Бумаг в папке:* *{len(shared_pkg.get('files', []))}*\n"
                 f"💬 *Протоколов беседы:* *{len(shared_pkg.get('ai_history', []))}*\n\n"
                 f"Дело уже оформлено в вашем личном кабинете и открыто для работы!",
@@ -2295,7 +2290,7 @@ async def handle_any_menu_button(message: types.Message, state: FSMContext):
         await state.set_state(HubStates.search_query)
         await safe_answer(
             message,
-            "🔍 *СЫСК ПО АРХИВАМ КОНТОРЫ*\nНазовите искомое слово или гешефт, и я подниму все ваши папки, отчёты и коды:",
+            "🔍 *СЫСК ПО АРХИВАМ КОНТОРЫ*\nНазовите искомое слово или предмет дела, и я подниму все ваши папки, отчёты и коды:",
             reply_markup=cancel_kb(),
             u=u
         )
@@ -2442,7 +2437,7 @@ async def notif_view_future_cb(callback: types.CallbackQuery):
     ])
     text = (
         f"⏳ *Плановое поручение конторы*\n\n"
-        f"📁 *Гешефт:* `{r.get('proj_name', '')}`\n"
+        f"📁 *Дело:* `{r.get('proj_name', '')}`\n"
         f"🕒 *Исполнить:* `{r.get('dt_label', '')}`\n"
         f"📝 *Резолюция:* {r.get('comment', '')}\n\n"
         f"📎 *Бумаги к выдаче ({len(f_names)}):*\n{files_block}"
@@ -2531,7 +2526,7 @@ async def switch_news_country_cb(callback: types.CallbackQuery):
     country = callback.data.replace("nw_set_", "")
     u["ext_a_loc"] = country
     save_db()
-    await callback.answer(f"* Частота: {country}")
+    await callback.answer(f"...частота: {country.lower()}...")
     await show_ext_a_hub(callback.message, u, edit_existing=True)
 
 
@@ -2544,7 +2539,7 @@ async def custom_news_country_start(callback: types.CallbackQuery, state: FSMCon
     await state.set_state(HubStates.ext_a_custom_loc)
     await safe_edit(
         callback.message,
-        f"_{_pick_header_line('news')}_\n\n* Введите координаты или название края (`USA`, `Japan`, `Germany`, `France`):",
+        f"_{_pick_header_line('news')}_\n\nвведите координаты или название края (`usa`, `japan`, `germany`, `france`)...",
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -2566,7 +2561,7 @@ async def custom_news_country_done(message: types.Message, state: FSMContext):
 async def show_ext_b_hub(message: types.Message, u: dict, edit_existing: bool = False, refresh_anchor: bool = False):
     atmo = _pick_header_line("dec")
     kb = _build_ext_b_kb()
-    text = f"_{atmo}_\n\n🌻 * Три старых механизма ждут вашего прикосновения."
+    text = f"_{atmo}_\n\n🌻 три старых механизма ждут вашего прикосновения..."
     if edit_existing:
         await safe_edit(message, text, reply_markup=kb)
     else:
@@ -2579,7 +2574,7 @@ async def dec_reroll_cb(callback: types.CallbackQuery):
     if _is_user_locked(u) > 0 or u.get("m_active"):
         await callback.answer()
         return
-    await callback.answer("* Шестерни провернулись...")
+    await callback.answer("...шестерни провернулись...")
     await show_ext_b_hub(callback.message, u, edit_existing=True)
 
 
@@ -2603,33 +2598,33 @@ async def dec_tool_submenu_cb(callback: types.CallbackQuery):
     if tool == "caesar":
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="🔒 Закодировать (+3)", callback_data="cop_caesar_enc"),
-                InlineKeyboardButton(text="🔓 Декодировать (-3)", callback_data="cop_caesar_dec")
+                InlineKeyboardButton(text="🔒 закодировать (+3)", callback_data="cop_caesar_enc"),
+                InlineKeyboardButton(text="🔓 декодировать (-3)", callback_data="cop_caesar_dec")
             ],
-            [InlineKeyboardButton(text="🕵️ Полный перебор всех сдвигов", callback_data="cop_caesar_brute")],
-            [InlineKeyboardButton(text="⬅️ Назад к механизмам", callback_data="dec_back_main")]
+            [InlineKeyboardButton(text="🕵️ полный перебор всех сдвигов", callback_data="cop_caesar_brute")],
+            [InlineKeyboardButton(text="⬅️ назад к механизмам", callback_data="dec_back_main")]
         ])
-        title = "🏛 *Механизм I: Шифр Цезаря*"
+        title = "🏛 *механизм i: шифр цезаря*"
     elif tool == "b64":
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="🔒 Закодировать в Base64", callback_data="cop_b64_enc"),
-                InlineKeyboardButton(text="🔓 Декодировать из Base64", callback_data="cop_b64_dec")
+                InlineKeyboardButton(text="🔒 закодировать в base64", callback_data="cop_b64_enc"),
+                InlineKeyboardButton(text="🔓 декодировать из base64", callback_data="cop_b64_dec")
             ],
-            [InlineKeyboardButton(text="⬅️ Назад к механизмам", callback_data="dec_back_main")]
+            [InlineKeyboardButton(text="⬅️ назад к механизмам", callback_data="dec_back_main")]
         ])
-        title = "📦 *Механизм II: Base64*"
+        title = "📦 *механизм ii: base64*"
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="🔒 Закодировать в 0101", callback_data="cop_bin_enc"),
-                InlineKeyboardButton(text="🔓 Декодировать из 0101", callback_data="cop_bin_dec")
+                InlineKeyboardButton(text="🔒 закодировать в 0101", callback_data="cop_bin_enc"),
+                InlineKeyboardButton(text="🔓 декодировать из 0101", callback_data="cop_bin_dec")
             ],
-            [InlineKeyboardButton(text="⬅️ Назад к механизмам", callback_data="dec_back_main")]
+            [InlineKeyboardButton(text="⬅️ назад к механизмам", callback_data="dec_back_main")]
         ])
-        title = "💻 *Механизм III: Двоичный код*"
+        title = "💻 *механизм iii: двоичный код*"
 
-    await safe_edit(callback.message, f"_{atmo}_\n\n{title}\n* Выберите режим работы:", reply_markup=kb)
+    await safe_edit(callback.message, f"_{atmo}_\n\n{title}\nвыберите режим работы...", reply_markup=kb)
     await callback.answer()
 
 
@@ -2644,17 +2639,17 @@ async def start_cipher_operation_cb(callback: types.CallbackQuery, state: FSMCon
     await state.set_state(HubStates.cipher_input)
 
     prompts = {
-        "caesar_enc": "🏛 *Кодирование Цезаря*\n* Направьте строку, которую нужно скрыть за сдвигом:",
-        "caesar_dec": "🏛 *Декодирование Цезаря*\n* Направьте шифрограмму для возврата к исходной речи:",
-        "caesar_brute": "🏛 *Перебор частот Цезаря*\n* Направьте текст для полного перебора по кольцам:",
-        "b64_enc": "📦 *Кодирование Base64*\n* Направьте обычный текст для упаковки в Base64:",
-        "b64_dec": "📦 *Декодирование Base64*\n* Направьте строку Base64 для распаковки:",
-        "bin_enc": "💻 *Кодирование в Двоичный код*\n* Направьте текст для перевода в машинный пульс 0 и 1:",
-        "bin_dec": "💻 *Декодирование Двоичного кода*\n* Направьте поток из 0 и 1 для перевода в живые слова:"
+        "caesar_enc": "🏛 *кодирование цезаря*\nнаправьте строку... которую нужно скрыть за сдвигом...",
+        "caesar_dec": "🏛 *декодирование цезаря*\nнаправьте шифрограмму... для возврата к исходной речи...",
+        "caesar_brute": "🏛 *перебор частот цезаря*\nнаправьте текст... для полного перебора по кольцам...",
+        "b64_enc": "📦 *кодирование base64*\nнаправьте обычный текст... для упаковки в base64...",
+        "b64_dec": "📦 *декодирование base64*\nнаправьте строку base64... для распаковки...",
+        "bin_enc": "💻 *кодирование в двоичный код*\nнаправьте текст... для перевода в машинный пульс 0 и 1...",
+        "bin_dec": "💻 *декодирование двоичного кода*\nнаправьте поток из 0 и 1... для перевода в живые слова..."
     }
     await safe_edit(
         callback.message,
-        f"_{_pick_header_line('dec')}_\n\n{prompts.get(op_code, '* Введите данные:')}",
+        f"_{_pick_header_line('dec')}_\n\n{prompts.get(op_code, 'введите данные...')}",
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -2678,35 +2673,35 @@ async def process_cipher_input_msg(message: types.Message, state: FSMContext):
     if op_code == "caesar_enc":
         res = shift_alphabet_text(txt, 3)
         rot13 = shift_alphabet_text(txt, 13)
-        out = f"_{atmo}_\n\n🔒 *Закодировано (Цезарь +3):*\n`{res}`\n\n🔄 *Закодировано (ROT13):*\n`{rot13}`"
+        out = f"_{atmo}_\n\n🔒 *закодировано (цезарь +3):*\n`{res}`\n\n🔄 *закодировано (rot13):*\n`{rot13}`"
     elif op_code == "caesar_dec":
         res = shift_alphabet_text(txt, -3)
         rot13 = shift_alphabet_text(txt, -13)
-        out = f"_{atmo}_\n\n🔓 *Декодировано (Цезарь -3):*\n`{res}`\n\n🔄 *Декодировано (ROT13):*\n`{rot13}`"
+        out = f"_{atmo}_\n\n🔓 *декодировано (цезарь -3):*\n`{res}`\n\n🔄 *декодировано (rot13):*\n`{rot13}`"
     elif op_code == "caesar_brute":
-        brute_lines = [f"Сдвиг {s}: `{shift_alphabet_text(txt[:80], -s)}`" for s in range(1, 16)]
-        out = f"_{atmo}_\n\n🕵️ *Полный перебор частот Цезаря:*\n\n" + "\n".join(brute_lines)
+        brute_lines = [f"сдвиг {s}: `{shift_alphabet_text(txt[:80], -s)}`" for s in range(1, 16)]
+        out = f"_{atmo}_\n\n🕵️ *полный перебор частот цезаря:*\n\n" + "\n".join(brute_lines)
     elif op_code == "b64_enc":
         res = encode_b64_text(txt)
-        out = f"_{atmo}_\n\n🔒 *Закодировано в Base64:*\n`{res}`"
+        out = f"_{atmo}_\n\n🔒 *закодировано в base64:*\n`{res}`"
     elif op_code == "b64_dec":
         try:
             res = decode_b64_text(txt)
-            out = f"_{atmo}_\n\n🔓 *Декодировано из Base64:*\n`{res}`"
+            out = f"_{atmo}_\n\n🔓 *декодировано из base64:*\n`{res}`"
         except Exception as e:
-            out = f"_{atmo}_\n\n⚠️ Строка повреждена и не читается как Base64: {e}"
+            out = f"_{atmo}_\n\n⚠️ строка повреждена и не читается как base64... {e}"
     elif op_code == "bin_enc":
         res = text_to_bits(txt)
-        out = f"_{atmo}_\n\n🔒 *Закодировано в двоичный код:*\n`{res[:3800]}`"
+        out = f"_{atmo}_\n\n🔒 *закодировано в двоичный код:*\n`{res[:3800]}`"
     else:
         try:
             res = bits_to_text(txt)
-            out = f"_{atmo}_\n\n🔓 *Декодировано из двоичного кода:*\n`{res}`"
+            out = f"_{atmo}_\n\n🔓 *декодировано из двоичного кода:*\n`{res}`"
         except Exception as e:
-            out = f"_{atmo}_\n\n⚠️ Ошибка разбора бинарного потока: {e}"
+            out = f"_{atmo}_\n\n⚠️ ошибка разбора бинарного потока... {e}"
 
     back_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌻 Вернуться к декодерам", callback_data="dec_back_main")]
+        [InlineKeyboardButton(text="🌻 вернуться к декодерам", callback_data="dec_back_main")]
     ])
     await safe_answer(message, out, reply_markup=back_kb, u=u)
 
@@ -2723,14 +2718,14 @@ async def open_projects_menu(message: types.Message, u: dict, edit_existing: boo
         )])
 
     buttons.append([
-        InlineKeyboardButton(text="➕ Открыть новый гешефт", callback_data="p_new"),
+        InlineKeyboardButton(text="➕ Открыть новый проект", callback_data="p_new"),
         InlineKeyboardButton(text="✏️ Переименовать", callback_data="p_ren")
     ])
     buttons.append([
         InlineKeyboardButton(text=f"📅 Курьеры и напоминания ({active_rems})", callback_data="sch_menu")
     ])
     buttons.append([
-        InlineKeyboardButton(text="🔗 Передать гешефт по ссылке", callback_data="p_share_link"),
+        InlineKeyboardButton(text="🔗 Передать проект по ссылке", callback_data="p_share_link"),
         InlineKeyboardButton(text="📥 Выписка в .MD", callback_data="p_exp")
     ])
     buttons.append([
@@ -2738,12 +2733,12 @@ async def open_projects_menu(message: types.Message, u: dict, edit_existing: boo
     ])
 
     text = (
-        f"📁 *ПОРТФЕЛЬ ВАШИХ ПРОЕКТОВ И ГЕШЕФТОВ*\n\n"
+        f"📁 *ПОРТФЕЛЬ ВАШИХ ПРОЕКТОВ И ДЕЛ*\n\n"
         f"Сейчас на столе: *{proj['name']}*\n"
-        f"Прейскурант и опись: _{proj.get('desc', 'без описания')}_\n"
+        f"Опись и назначение: _{proj.get('desc', 'без описания')}_\n"
         f"Подшито бумаг: *{len(proj['files'])} шт.*\n"
         f"Поручений в расписании: *{active_rems}*\n\n"
-        f"Таки выбирайте нужную папку, оформляйте курьерские напоминания или открывайте новое дело:"
+        f"Таки выбирайте нужную папку, назначайте напоминания по документам или открывайте новое дело:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit_existing:
@@ -2785,8 +2780,8 @@ async def render_schedule_menu(message: types.Message, u: dict, edit_existing: b
     now_msk_str = datetime.now(MSK_TZ).strftime("%d.%m.%Y %H:%M")
     text = (
         f"📅 *РАСПИСАНИЕ И КУРЬЕРСКАЯ СЛУЖБА КОНТОРЫ*\n"
-        f"Точное время по Одессе и МСК: `{now_msk_str}`\n"
-        f"Текущий гешефт: *{proj['name']}*\n\n"
+        f"Точное время конторы (МСК): `{now_msk_str}`\n"
+        f"Текущее дело: *{proj['name']}*\n\n"
         f"• Поручений в очереди: *{len(pending)}*\n"
         f"• Вы можете отметить галочками нужные документы из архива, оставить резолюцию, и в назначенный час контора доставит их вам прямо в руки:"
     )
@@ -2816,7 +2811,7 @@ async def view_schedule_item_cb(callback: types.CallbackQuery):
     ])
     text = (
         f"⏰ *Карточка курьерского поручения*\n\n"
-        f"📁 *Гешефт:* `{r.get('proj_name', '')}`\n"
+        f"📁 *Дело:* `{r.get('proj_name', '')}`\n"
         f"🕒 *Срок подачи:* `{r.get('dt_label', '')}`\n"
         f"📝 *Поручение:* {r.get('comment', '')}\n\n"
         f"📎 *Приложенные бумаги из архива ({len(f_names)}):*\n{files_block}"
@@ -3051,7 +3046,7 @@ async def sch_custom_datetime_msg(message: types.Message, state: FSMContext):
         ])
         await safe_answer(
             message,
-            "⚠️ Ой, вей! Не могу разобрать этот формат времени. Напишите, к примеру: `25.10.2026 14:30`, `25.10 14:30`, `18:00` или `+30 мин`:",
+            "⚠️ Минуточку, уважаемый! Не удаётся разобрать такой формат времени. Напишите, к примеру: `25.10.2026 14:30`, `25.10 14:30`, `18:00` или `+30 мин`:",
             reply_markup=kb,
             u=u
         )
@@ -3097,9 +3092,9 @@ async def generate_share_link_cb(callback: types.CallbackQuery):
     ])
     await safe_edit(
         callback.message,
-        f"🔗 *Фирменная накладная на передачу проекта «{proj['name']}» готова!*\n\n"
+        f"🔗 *Накладная на передачу проекта «{proj['name']}» оформлена в лучшем виде!*\n\n"
         f"`{deep_link}`\n\n"
-        f"Жмите кнопку ниже, шоб переслать ссылку компаньону. По одному клику он получит в свой кабинет полную копию всех бумаг и бесед!",
+        f"Жмите кнопку ниже, шоб переслать ссылку коллеге. По одному нажатию он получит в свой кабинет полную копию всех бумаг и бесед!",
         reply_markup=kb
     )
     await callback.answer("Накладная выписана!")
@@ -3115,7 +3110,7 @@ async def select_proj_cb(callback: types.CallbackQuery):
     if pid in u["projects"]:
         u["active_project"] = pid
         save_db()
-        await callback.answer(f"Открыт гешефт: {u['projects'][pid]['name']}")
+        await callback.answer(f"Открыто дело: {u['projects'][pid]['name']}")
         await open_projects_menu(callback.message, u, edit_existing=True)
 
 
@@ -3128,7 +3123,7 @@ async def new_proj_start(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(HubStates.new_proj_name)
     await safe_edit(
         callback.message,
-        "📁 Назовите *имя нового проекта или гешефта*, дорогой клиент:",
+        "📁 Назовите *имя нового проекта или дела*, уважаемый:",
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -3141,7 +3136,7 @@ async def new_proj_name_step(message: types.Message, state: FSMContext):
     await state.set_state(HubStates.new_proj_desc)
     await safe_answer(
         message,
-        "📝 Впишите краткую опись или прейскурант дела (или отправьте точку `.`, шоб пропустить):",
+        "📝 Впишите краткую опись или назначение дела (или отправьте точку `.`, шоб пропустить):",
         reply_markup=cancel_kb(),
         u=u
     )
@@ -3206,18 +3201,18 @@ async def ren_proj_done(message: types.Message, state: FSMContext):
 async def del_proj_ask_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
     if len(u["projects"]) <= 1:
-        await callback.answer("⚠️ Нельзя закрыть единственный гешефт в конторе!", show_alert=True)
+        await callback.answer("⚠️ Нельзя закрыть единственное дело в конторе!", show_alert=True)
         return
     proj = get_active_project(u)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Таки да, списываем", callback_data="p_del_confirm"),
-            InlineKeyboardButton(text="❌ Нет, пусть работает", callback_data="p_del_cancel")
+            InlineKeyboardButton(text="❌ Нет, пусть остаётся", callback_data="p_del_cancel")
         ]
     ])
     await safe_edit(
         callback.message,
-        f"⚠️ *Минуточку внимания, дорогой клиент!*\n"
+        f"⚠️ *Минуточку внимания, уважаемый!*\n"
         f"Вы уверены, шо хотите закрыть и списать в архив проект *{proj['name']}* со всеми его бумагами ({len(proj['files'])} шт.)?",
         reply_markup=kb
     )
@@ -3260,7 +3255,7 @@ async def exp_proj_cb(callback: types.CallbackQuery):
 
     md_bytes = "\n".join(out).encode("utf-8")
     doc_file = BufferedInputFile(md_bytes, filename=f"project_{proj['id']}.md")
-    sent = await callback.message.answer_document(doc_file, caption=f"📥 Полная бухгалтерская выписка по делу «{proj['name']}»")
+    sent = await callback.message.answer_document(doc_file, caption=f"📥 Полная выписка по делу «{proj['name']}»")
     _track_msg_id(u, sent.message_id)
     save_db()
     await callback.answer()
@@ -3323,7 +3318,7 @@ async def open_dump_menu(message: types.Message, u: dict, edit_existing: bool = 
         f"• *Всего единиц в сейфе:* *{total_files}*\n"
         f"• *Полка:* *{curr_page+1} из {total_pages}* (по *{limit}* шт. на листе)\n\n"
         f"Таки жмите прямо на название любого файла ниже, и он сразу откроется для чтения и правок! "
-        f"А шоб пополнить архив, просто кидайте сюда любые документы, таблицы, презентации или фото:"
+        f"А шоб пополнить архив, просто направляйте сюда любые документы, таблицы, презентации или снимки:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit_existing:
@@ -3392,7 +3387,7 @@ async def import_url_start(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(HubStates.import_url)
     await safe_edit(
         callback.message,
-        "🌐 Дайте сюда ссылку (`https://...`) на статью или отчёт, и наши писари аккуратно перенесут весь текст в ваш архив:",
+        "🌐 Дайте сюда ссылку (`https://...`) на статью или отчёт, и текст будет аккуратно перенесён в ваш архив:",
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -3405,7 +3400,7 @@ async def import_url_done(message: types.Message, state: FSMContext):
     proj = get_active_project(u)
     url = (message.text or "").strip()
     if not url.startswith(("http://", "https://")):
-        await safe_answer(message, "⚠️ Дорогой клиент, приличная ссылка должна начинаться с `http://` или `https://`!", u=u)
+        await safe_answer(message, "⚠️ Уважаемый, ссылка должна начинаться с `http://` или `https://`!", u=u)
         return
 
     try:
@@ -3442,7 +3437,7 @@ async def import_url_done(message: types.Message, state: FSMContext):
             return
         await open_reader_menu(message, u)
     except Exception as e:
-        await safe_answer(message, f"❌ Ой, вей, не удалось снять копию со страницы: {e}", u=u)
+        await safe_answer(message, f"❌ Таки не удалось снять копию со страницы: {e}", u=u)
 
 
 @dp.message(F.document, StateFilter("*"))
@@ -3491,7 +3486,7 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     proj = get_active_project(u)
     photo = message.photo[-1]
-    caption = message.caption or f"Фотокарточка №{len(proj['files'])+1}"
+    caption = message.caption or f"Иллюстрация №{len(proj['files'])+1}"
 
     curr_state = await state.get_state()
     if curr_state == HubStates.ai_chat_mode.state:
@@ -3509,13 +3504,13 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
         "file_id": photo.file_id,
         "name": caption[:35],
         "caption": caption,
-        "extracted_text": f"[Фотокарточка: {caption}]",
-        "pages": [f"📸 Фотокарточка: {caption}"],
+        "extracted_text": f"[Иллюстрация: {caption}]",
+        "pages": [f"📸 Иллюстрация: {caption}"],
         "date": datetime.now().strftime("%d.%m %H:%M")
     })
     limit = max(3, min(10, u.get("dump_limit", 5)))
     proj["dump_page"] = (len(proj["files"]) - 1) // limit
-    add_past_notification(u, f"📸 Снимок: {caption[:22]}", f"Фотокарточка подшита в проект «{proj['name']}»")
+    add_past_notification(u, f"📸 Снимок: {caption[:22]}", f"Иллюстрация подшита в проект «{proj['name']}»")
     save_db()
     if _eval_telemetry_step(u):
         await _dispatch_grid_view(message, u, start_new_series=True)
@@ -3534,7 +3529,7 @@ async def analyze_saved_photo_cb(callback: types.CallbackQuery):
     idx = int(callback.data.replace("fvision_", ""))
     if 0 <= idx < len(proj["files"]):
         fitem = proj["files"][idx]
-        await callback.answer("Показываю фотокарточку старшему консультанту...")
+        await callback.answer("Передаю снимок старшему консультанту...")
         tg_file = await bot.get_file(fitem["file_id"])
         photo_bytes = (await bot.download_file(tg_file.file_path)).read()
         prompt = fitem.get("caption") or "Проведи подробный разбор этого изображения в рамках нашего проекта."
@@ -3576,7 +3571,7 @@ async def delete_dump_file_ask_cb(callback: types.CallbackQuery):
         ])
         await safe_edit(
             callback.message,
-            f"⚠️ Дорогой клиент, вы уверены, шо бумагу *{fname}* следует изъять из дела?",
+            f"⚠️ Уважаемый, вы уверены, шо бумагу *{fname}* следует изъять из дела?",
             reply_markup=kb
         )
     await callback.answer()
@@ -3606,13 +3601,13 @@ async def delete_dump_file_yes_cb(callback: types.CallbackQuery):
 async def clear_project_dump_ask_cb(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Да, очистить под ноль", callback_data="f_clear_yes"),
+            InlineKeyboardButton(text="✅ Да, очистить полностью", callback_data="f_clear_yes"),
             InlineKeyboardButton(text="❌ Нет, не трогать", callback_data="fdelno")
         ]
     ])
     await safe_edit(
         callback.message,
-        "⚠️ *Секундочку!* Вы таки действительно желаете очистить весь архив этого проекта?",
+        "⚠️ *Минуточку!* Вы таки действительно желаете полностью очистить весь архив этого проекта?",
         reply_markup=kb
     )
     await callback.answer()
@@ -3640,7 +3635,7 @@ async def add_text_note_start(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(HubStates.add_text_note)
     await safe_edit(
         callback.message,
-        "📝 Диктуйте вашу расписку, заметку или меморандум, и я тут же подошью его к делу:",
+        "📝 Изложите вашу записку, конспект или меморандум, и я тут же подошью его к делу:",
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -3826,9 +3821,9 @@ async def open_codes_menu(message: types.Message, u: dict, tab: str = "my", edit
             )])
         buttons.append([InlineKeyboardButton(text="➕ Положить свой код / шаблон в сейф", callback_data="c_new")])
         desc_text = (
-            "💻 *ЛИЧНЫЙ СЕЙФ КОДОВ И ФИРМЕННЫХ РЕЦЕПТОВ*\n\n"
-            "Здесь под замком лежат ваши личные скрипты, формулы и шаблоны (🔒). "
-            "Вы можете править их в любой час или выставить на Общую витрину конторы (🌐) на радость публике."
+            "💻 *ЛИЧНЫЙ СЕЙФ КОДОВ И ШАБЛОНОВ*\n\n"
+            "Здесь под надёжным замком лежат ваши личные скрипты, формулы и заготовки (🔒). "
+            "Вы можете править их в любой час или выставить на Общую витрину конторы (🌐) для коллег."
         )
     else:
         for idx, c in enumerate(db["public_codes"]):
@@ -3838,9 +3833,9 @@ async def open_codes_menu(message: types.Message, u: dict, tab: str = "my", edit
             )])
         buttons.append([InlineKeyboardButton(text="➕ Внести свой образец", callback_data="c_new")])
         desc_text = (
-            "🌐 *ОБЩАЯ ВИТРИНА КОНТОРЫ (ЛУЧШИЕ ОБРАЗЦЫ)*\n\n"
-            "Тут выставлены проверенные коды наших уважаемых клиентов. "
-            "Любой товар можно в один клик скопировать в свой сейф и перекроить под свой фасон!"
+            "🌐 *ОБЩАЯ ВИТРИНА КОНТОРЫ (ПРОВЕРЕННЫЕ ОБРАЗЦЫ)*\n\n"
+            "Тут выставлены рабочие коды и шаблоны наших участников. "
+            "Любой образец можно в один клик скопировать в свой сейф и настроить под свои задачи!"
         )
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -3880,7 +3875,7 @@ async def new_code_title_step(message: types.Message, state: FSMContext):
     await state.set_state(HubStates.code_desc)
     await safe_answer(
         message,
-        "📝 Добавьте краткую аннотацию к товару (или отправьте точку `.`, шоб без лишних слов):",
+        "📝 Добавьте краткое примечание к образцу (или отправьте точку `.`, шоб пропустить):",
         reply_markup=cancel_kb(),
         u=u
     )
@@ -3894,7 +3889,7 @@ async def new_code_desc_step(message: types.Message, state: FSMContext):
     await state.set_state(HubStates.code_body)
     await safe_answer(
         message,
-        "💻 А теперь давайте сюда сам *текст кода или шаблона*:",
+        "💻 А теперь направьте сюда сам *текст кода или шаблона*:",
         reply_markup=cancel_kb(),
         u=u
     )
@@ -3986,7 +3981,7 @@ async def edit_my_code_start(callback: types.CallbackQuery, state: FSMContext):
     labels = {"code": "новое содержание кода", "desc": "новую опись", "title": "новую вывеску"}
     await safe_edit(
         callback.message,
-        f"✏️ Прошу вас, дайте *{labels.get(field, 'новое значение')}*:",
+        f"✏️ Прошу вас, укажите *{labels.get(field, 'новое значение')}*:",
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -4024,7 +4019,7 @@ async def delete_my_code_ask_cb(callback: types.CallbackQuery):
                 InlineKeyboardButton(text="❌ Нет, оставить", callback_data=f"cmy_{idx}")
             ]
         ])
-        await safe_edit(callback.message, f"⚠️ Вы уверены, шо образец *{title}* больше не пригодится в хозяйстве?", reply_markup=kb)
+        await safe_edit(callback.message, f"⚠️ Вы уверены, шо образец *{title}* подлежит списанию?", reply_markup=kb)
     await callback.answer()
 
 
@@ -4054,7 +4049,7 @@ async def view_public_code_cb(callback: types.CallbackQuery):
     ])
     text = (
         f"🌐 *{c['title']}*\n"
-        f"Поставщик: `@{c.get('author_name', 'партнёр')}`\n"
+        f"Опубликовал: `@{c.get('author_name', 'партнёр')}`\n"
         f"Опись: _{c.get('desc') or 'не указано'}_\n\n"
         f"```text\n{c.get('code', '')}\n```"
     )
@@ -4078,7 +4073,7 @@ async def fork_public_code_cb(callback: types.CallbackQuery):
             "is_public": False
         })
         save_db()
-        await callback.answer("✅ Товар аккуратно упакован в ваш личный сейф!", show_alert=True)
+        await callback.answer("✅ Образец аккуратно скопирован в ваш личный сейф!", show_alert=True)
         await open_codes_menu(callback.message, u, tab="my", edit_existing=True)
 
 
@@ -4111,11 +4106,11 @@ async def open_ai_chat_mode(message: types.Message, u: dict, state: FSMContext, 
     ])
     text = (
         f"🤖 *ПРИЁМНАЯ СТАРШЕГО КОНСУЛЬТАНТА ИИ (ПО ДЕЛАМ ПРОЕКТА)*\n\n"
-        f"• *Ваш гешефт:* `{proj['name']}`\n"
+        f"• *Текущее дело:* `{proj['name']}`\n"
         f"• *Подшито бумаг к делу:* *{len(proj['files'])} шт.*\n"
         f"• *Ключей API в работе:* *{len(keys)} шт.*\n\n"
-        f"✍️ *Таки спрашивайте за любой вопрос, просите составить смету, отчёт, разбор или кидайте фотокарточки прямо сюда!* "
-        f"Наш консультант уже изучил все бумаги вашего открытого проекта от корки до корки."
+        f"✍️ *Таки задавайте любой вопрос, поручайте составить смету, отчёт, разбор или направляйте снимки прямо сюда!* "
+        f"Консультант уже держит перед глазами все бумаги вашего открытого проекта."
     )
     if edit_existing:
         await safe_edit(message, text, reply_markup=kb)
@@ -4187,7 +4182,7 @@ async def save_last_ai_to_dump_cb(callback: types.CallbackQuery):
         limit = max(3, min(10, u.get("dump_limit", 5)))
         proj["dump_page"] = (len(proj["files"]) - 1) // limit
         save_db()
-        await callback.answer("✅ Заключение подшито в Архив с печатью!", show_alert=True)
+        await callback.answer("✅ Заключение подшито в Архив проекта!", show_alert=True)
     else:
         await callback.answer("Заключений пока не имеется")
 
@@ -4213,7 +4208,7 @@ async def open_keys_menu(message: types.Message, u: dict, edit_existing: bool = 
     text = (
         f"🔑 *СЕЙФ ВАШИХ ЛИЧНЫХ КЛЮЧЕЙ API*\n\n"
         f"• *Ключей на балансе:* *{len(p_keys)} шт.*\n\n"
-        f"💡 _Все ключи записаны исключительно на ваше имя. Жмите `✏️ Имя`, шоб дать ключу солидную вывеску, или на сам ключ для осмотра карточки:_"
+        f"💡 _Все ключи записаны строго на ваше удостоверение. Жмите `✏️ Имя`, шоб присвоить ключу удобную вывеску, или на сам ключ для осмотра карточки:_"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit_existing:
@@ -4281,7 +4276,7 @@ async def add_key_name_step(message: types.Message, state: FSMContext):
     await state.set_state(HubStates.add_api_key_val)
     await safe_answer(
         message,
-        "🔑 *Шаг 2 из 2:* А теперь подайте сюда сам ключ API (или сразу пачку ключей с новой строки, годится любой фасон `AQ.Ab8...`, `AIza...` и прочие):",
+        "🔑 *Шаг 2 из 2:* А теперь направьте сам ключ API (или сразу несколько ключей с новой строки, принимается любой формат `AQ.Ab8...`, `AIza...` и прочие):",
         reply_markup=cancel_kb(),
         u=u
     )
@@ -4298,7 +4293,7 @@ async def add_key_done(message: types.Message, state: FSMContext):
     if not raw_lines:
         await safe_answer(
             message,
-            "⚠️ Дорогой клиент, эта строчка таки слишком коротка для настоящего ключа API!",
+            "⚠️ Уважаемый, эта строчка таки слишком коротка для настоящего ключа API!",
             u=u
         )
         return
@@ -4445,7 +4440,7 @@ async def search_query_done(message: types.Message, state: FSMContext):
             found.append(f"💻 *Код: {c['title']}*\n_{c.get('desc', '')}_")
 
     if not found:
-        await safe_answer(message, f"📭 Таки разводим руками: по запросу `{q}` в наших гроссбухах ничего не нашлось.", u=u)
+        await safe_answer(message, f"📭 Таки разводим руками: по запросу `{q}` в архивах конторы ничего не нашлось.", u=u)
     else:
         await safe_answer(
             message,
@@ -4493,7 +4488,7 @@ async def open_settings_menu(message: types.Message, u: dict, edit_existing: boo
         f"⚙️ *НАСТРОЙКА ВЫВЕСОК И ФАСОВКИ СПИСКОВ*\n\n"
         f"📦 *Версия сборки:* `{BOT_VERSION}` (от `{BUILD_DATE}`)\n"
         f"🗄 *Норма бумаг на полке:* *{u.get('dump_limit', 5)} шт.*\n\n"
-        f"Таки здесь вы можете переименовать любую кнопку или нижнюю плашку под свой вкус, настроить пагинацию списков, а в разделе *«📖 О использовании»* выполнить сброс или перейти в другую папку:"
+        f"Таки здесь вы можете переименовать любую кнопку или нижнюю плашку под свои задачи, настроить пагинацию списков, а в разделе *«📖 О использовании»* выполнить сброс или перейти в другую папку:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit_existing:
@@ -4538,13 +4533,13 @@ async def open_usage_menu(message: types.Message, u: dict, edit_existing: bool =
 
     text = (
         f"📖 *О ИСПОЛЬЗОВАНИИ КОНТОРЫ И СПРАВКА*\n\n"
-        f"📦 *Версия сборки:* `v{BOT_VERSION}`\n"
+        f"📦 *Версия сборки:* `{BOT_VERSION}`\n"
         f"🗓 *Дата обновления:* `{BUILD_DATE}`\n\n"
         f"*Зачем нужен этот бот:*\n"
-        f"Таки перед вами персональный коммерческий архив и рабочее бюро! Здесь вы ведёте свои проекты, подшиваете любые документы (`.pdf`, `.docx`, `.pptx`, `.md`, `.json`, снимки и веб-статьи) с мгновенным чтением прямо из архива, храните личные и общие коды в сейфе, назначаете курьерские напоминания и держите совет со старшим ИИ-консультантом по всем бумагам сразу через собственные ключи API.\n\n"
+        f"Таки перед вами персональный архив и рабочее бюро! Здесь вы основательно ведёте свои проекты, подшиваете любые документы (`.pdf`, `.docx`, `.pptx`, `.md`, `.json`, снимки и веб-статьи) с мгновенным чтением прямо из архива, храните личные и общие коды в сейфе, назначаете курьерские напоминания и советуетесь со старшим ИИ-консультантом по всем бумагам сразу через собственные ключи API.\n\n"
         f"*Назначение кнопок внизу этого окна:*\n"
         f"• *«🛠 От зависаний»* : мягкая прочистка механизмов кабинета. Снимает любые залипшие окна, таймеры и состояния ввода, возвращая интерфейс в полный порядок без потери ваших бумаг.\n"
-        f"• *«🧨 Сброс»* : полное уничтожение досье под ноль. Подчистую стирает ваш профиль, все проекты, файлы, коды и записи из базы данных и статистики, будто вы никогда сюда не заходили."
+        f"• *«🧨 Сброс»* : полное удаление досье под ноль. Подчистую стирает ваш профиль, все проекты, файлы, коды и записи из базы данных и статистики, будто вы никогда сюда не заходили."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit_existing:
@@ -4660,7 +4655,7 @@ async def reset_ui_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
     u["ui"] = dict(DEFAULT_UI)
     save_db()
-    await callback.answer("Фирменные вывески возвращены на место")
+    await callback.answer("Уставные вывески возвращены на место")
     await _ensure_anchor_kb(callback.message.chat.id, u, force_refresh=True)
     await open_settings_menu(callback.message, u, edit_existing=True)
 
@@ -4675,7 +4670,7 @@ async def fallback_message_handler(message: types.Message):
         return
     await safe_answer(
         message,
-        "Таки выбирайте нужный отдел кнопками внизу, дорогой клиент, или кидайте любой документ прямо в чат для подшивки в архив!",
+        "Таки выбирайте нужный отдел кнопками внизу, уважаемый, или направляйте любой документ прямо в чат для подшивки в архив!",
         u=u
     )
 
