@@ -1,10 +1,13 @@
 import asyncio
 import base64
+import copy
 import hashlib
+import hmac
 import html
 import io
 import ipaddress
 import json
+import multiprocessing
 import os
 import random
 import re
@@ -15,9 +18,11 @@ import time
 import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import aiohttp
+from aiohttp.abc import AbstractResolver
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandObject, StateFilter
@@ -28,6 +33,11 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     BufferedInputFile, LinkPreviewOptions, ChatMemberUpdated
 )
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 try:
     from pypdf import PdfReader
@@ -46,20 +56,25 @@ except ImportError:
 
 load_dotenv()
 
-BOT_VERSION = "1.51K Stable"
+BOT_VERSION = "1.55"
 BUILD_DATE = "20.10.2026"
 INACTIVE_TTL = 180 * 86400
 
 SERVER_TOTAL_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
 USER_BASE_LIMIT_BYTES = 100 * 1024 * 1024
 MAX_WEB_IMPORT_BYTES = 512 * 1024
+MAX_DOC_DOWNLOAD_BYTES = 10 * 1024 * 1024
 MAX_AI_HISTORY_ITEMS = 20
+MAX_REMINDERS_PER_USER = 15
+MAX_SHARE_LINKS_PER_USER = 10
+MAX_ZIP_UNCOMPRESSED_BYTES = 25 * 1024 * 1024
 
 DATA_DIR = os.getenv("DATA_DIR", "/app/data" if os.path.exists("/app/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "universal_hub_db.json")
 STAT_FILE = os.path.join(DATA_DIR, "stat")
 ADMIN_CMD_FILE = os.path.join(DATA_DIR, "admin_cmd.queue")
+ADMIN_ACK_FILE = os.path.join(DATA_DIR, "admin_cmd.ack")
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 MSK_TZ = timezone(timedelta(hours=3))
@@ -70,6 +85,27 @@ _SEQ_EVENTS = {}
 _DISK_CACHE = {"ts": 0.0, "bytes": 0}
 _SAVE_LOCK = None
 _SAVE_PENDING = False
+_UPLOAD_SEM = None
+
+
+def _get_upload_sem() -> asyncio.Semaphore:
+    global _UPLOAD_SEM
+    if _UPLOAD_SEM is None:
+        _UPLOAD_SEM = asyncio.Semaphore(2)
+    return _UPLOAD_SEM
+
+
+def _install_cli_wrapper():
+    script_path = os.path.abspath(sys.argv[0] if sys.argv else __file__)
+    py_exec = sys.executable or "python3"
+    wrapper_body = f"#!/bin/sh\nexec \"{py_exec}\" \"{script_path}\" admin \"$@\"\n"
+    for target_bin in ("/usr/local/bin/admin", "/usr/bin/admin", "/bin/admin", "/app/admin"):
+        try:
+            with open(target_bin, "w", encoding="utf-8") as wf:
+                wf.write(wrapper_body)
+            os.chmod(target_bin, 0o755)
+        except Exception:
+            pass
 
 
 def get_host_token() -> str:
@@ -87,43 +123,82 @@ def _get_crypto_secret() -> bytes:
     try:
         raw = get_host_token()
     except Exception:
-        raw = "default_fallback_secret_key_151k"
-    return hashlib.sha256(f"hub_key_salt::{raw}".encode("utf-8")).digest()
+        raw = "default_fallback_secret_key_155"
+    extra = os.getenv("CORE_KEY", "")
+    return hashlib.sha256(f"hub_key_salt_v2::{raw}::{extra}".encode("utf-8")).digest()
 
 
 _CRYPTO_SECRET = _get_crypto_secret()
 
 
-def encrypt_api_key(plain_key: str) -> str:
-    if not plain_key or plain_key.startswith("enc1:"):
+def encrypt_api_key(plain_key: str, uid: str = "") -> str:
+    if not plain_key:
+        return ""
+    if plain_key.startswith("enc2:"):
         return plain_key
+    if plain_key.startswith("enc1:"):
+        plain_key = decrypt_api_key(plain_key, uid=uid)
+        if not plain_key:
+            return ""
     raw_b = plain_key.encode("utf-8")
+    nonce = os.urandom(16)
+    subkey = hmac.new(_CRYPTO_SECRET, f"uid:{uid}".encode("utf-8") + nonce, hashlib.sha256).digest()
     out = bytearray(len(raw_b))
     for i, b in enumerate(raw_b):
-        k_byte = hashlib.sha256(_CRYPTO_SECRET + i.to_bytes(4, "big")).digest()[0]
-        out[i] = b ^ k_byte
-    return "enc1:" + base64.urlsafe_b64encode(bytes(out)).decode("ascii")
+        blk = hmac.new(subkey, i.to_bytes(4, "big"), hashlib.sha256).digest()[0]
+        out[i] = b ^ blk
+    mac = hmac.new(subkey, bytes(out), hashlib.sha256).digest()[:16]
+    payload = nonce + mac + bytes(out)
+    return "enc2:" + base64.urlsafe_b64encode(payload).decode("ascii")
 
 
-def decrypt_api_key(stored_key: str) -> str:
-    if not stored_key or not stored_key.startswith("enc1:"):
-        return stored_key
-    try:
-        enc_b = base64.urlsafe_b64decode(stored_key[5:].encode("ascii"))
-        out = bytearray(len(enc_b))
-        for i, b in enumerate(enc_b):
-            k_byte = hashlib.sha256(_CRYPTO_SECRET + i.to_bytes(4, "big")).digest()[0]
-            out[i] = b ^ k_byte
-        return bytes(out).decode("utf-8")
-    except Exception:
+def decrypt_api_key(stored_key: str, uid: str = "") -> str:
+    if not stored_key:
         return ""
+    if stored_key.startswith("enc2:"):
+        try:
+            raw = base64.urlsafe_b64decode(stored_key[5:].encode("ascii"))
+            if len(raw) < 32:
+                return ""
+            nonce, mac, ct = raw[:16], raw[16:32], raw[32:]
+            for candidate_uid in (uid, ""):
+                subkey = hmac.new(_CRYPTO_SECRET, f"uid:{candidate_uid}".encode("utf-8") + nonce, hashlib.sha256).digest()
+                exp_mac = hmac.new(subkey, ct, hashlib.sha256).digest()[:16]
+                if hmac.compare_digest(mac, exp_mac):
+                    out = bytearray(len(ct))
+                    for i, b in enumerate(ct):
+                        blk = hmac.new(subkey, i.to_bytes(4, "big"), hashlib.sha256).digest()[0]
+                        out[i] = b ^ blk
+                    return bytes(out).decode("utf-8")
+            return ""
+        except Exception:
+            return ""
+    if stored_key.startswith("enc1:"):
+        try:
+            old_secret = hashlib.sha256(f"hub_key_salt::{get_host_token()}".encode("utf-8")).digest()
+            enc_b = base64.urlsafe_b64decode(stored_key[5:].encode("ascii"))
+            out = bytearray(len(enc_b))
+            for i, b in enumerate(enc_b):
+                k_byte = hashlib.sha256(old_secret + i.to_bytes(4, "big")).digest()[0]
+                out[i] = b ^ k_byte
+            return bytes(out).decode("utf-8")
+        except Exception:
+            return ""
+    return stored_key
+
+
+def _clean_log_str(val: str, max_len: int = 45) -> str:
+    if not val:
+        return ""
+    s = "".join(ch for ch in str(val) if ch >= " " and ch != "\x7f")
+    return s.strip()[:max_len]
 
 
 def esc_md(text: str) -> str:
     if not text:
         return ""
     cleaned = str(text)
-    for ch in ("_", "*", "`", "[", "]", "(", ")"):
+    for ch in ("\\", "_", "*", "`", "[", "]", "(", ")", "~", ">"):
         cleaned = cleaned.replace(ch, "")
     return cleaned
 
@@ -406,12 +481,16 @@ def get_user_used_bytes(u: dict) -> int:
             total += len((h.get("text", "") or "").encode("utf-8"))
     for c in u.get("my_codes", []):
         total += len((c.get("code", "") or "").encode("utf-8")) + len((c.get("desc", "") or "").encode("utf-8"))
+    for r in u.get("reminders", []):
+        total += len((r.get("comment", "") or "").encode("utf-8")) + 256 * len(r.get("files", []))
+    for n in u.get("notifications", []):
+        total += len((n.get("text", "") or "").encode("utf-8")) + 128
     return total
 
 
 def _get_cached_disk_bytes() -> int:
     now = time.time()
-    if now - _DISK_CACHE["ts"] < 60.0:
+    if now - _DISK_CACHE["ts"] < 5.0 and _DISK_CACHE["bytes"] > 0:
         return _DISK_CACHE["bytes"]
     used = 0
     try:
@@ -480,20 +559,33 @@ def load_db() -> dict:
                     data.setdefault("admin_notes", {})
                     data.setdefault("project_requests", {})
                     now_ts = int(time.time())
+                    for k_sh, v_sh in list(data["shared_links"].items()):
+                        v_sh.pop("files", None)
+                        v_sh.pop("ai_history", None)
+                    for req_k, req_v in list(data["project_requests"].items()):
+                        if req_v.get("status") != "pending":
+                            data["project_requests"].pop(req_k, None)
                     for uid, udata in data["users"].items():
                         if udata.get("is_admin") and uid not in data["admins"]:
                             data["admins"][uid] = {
                                 "uid": uid,
-                                "username": udata.get("username", f"ID_{uid}"),
-                                "note": data["admin_notes"].get(uid, ""),
+                                "username": _clean_log_str(udata.get("username", f"ID_{uid}")),
+                                "note": _clean_log_str(data["admin_notes"].get(uid, "")),
                                 "added_at": datetime.now().strftime("%d.%m.%Y %H:%M")
                             }
                         if uid in data["admins"]:
                             udata["is_admin"] = True
                         for kobj in udata.get("personal_keys", []):
                             if isinstance(kobj, dict) and "key" in kobj:
-                                kobj["key"] = encrypt_api_key(kobj["key"])
-                    if not data.get("v151k_migrated"):
+                                kobj["key"] = encrypt_api_key(kobj["key"], uid=uid)
+                        for p in udata.get("projects", {}).values():
+                            for fitem in p.get("files", []):
+                                fitem.pop("pages", None)
+                                fitem.pop("size_bytes", None)
+                        for rem in udata.get("reminders", []):
+                            for rf in rem.get("files", []):
+                                rf.pop("extracted_text", None)
+                    if not data.get("v155_migrated"):
                         for udata in data["users"].values():
                             udata["m_active"] = False
                             udata["m_phase"] = None
@@ -514,12 +606,12 @@ def load_db() -> dict:
                             ui_d["bar_proj"] = f"🧭 Группа: Проекты • Сборка v{BOT_VERSION}"
                             ui_d["bar_forest"] = f"🌲 Группа: Лес • Сборка v{BOT_VERSION}"
                             ui_d.setdefault("btn_usage", "📖 О использовании")
-                        data["v151k_migrated"] = True
+                        data["v155_migrated"] = True
                     return data
         except Exception:
             pass
     return {
-        "v151k_migrated": True,
+        "v155_migrated": True,
         "users": {},
         "public_codes": [],
         "shared_links": {},
@@ -552,55 +644,40 @@ def _build_console_admin_table(data: dict) -> str:
     else:
         for uid, ainfo in admins.items():
             u_obj = users.get(uid, {})
-            uname = u_obj.get("username") or ainfo.get("username") or "unknown"
-            note = notes.get(uid) or ainfo.get("note") or u_obj.get("admin_note") or "-"
-            lines.append(f"  * id={uid:<12} | @{uname:<18} | note: {note}")
+            uname = _clean_log_str(u_obj.get("username") or ainfo.get("username") or "unknown", 20)
+            note = _clean_log_str(notes.get(uid) or ainfo.get("note") or u_obj.get("admin_note") or "-", 40)
+            lines.append(f"  * id={uid:<12} | @{uname:<20} | note: {note}")
 
     lines.append(f"\nPENDING REQUESTS ({len(pend)}):")
     if not pend:
         lines.append("  (none)")
     else:
         for uid, pinfo in pend.items():
-            uname = pinfo.get("username") or users.get(uid, {}).get("username") or "unknown"
-            note = notes.get(uid) or "-"
-            lines.append(f"  ? id={uid:<12} | @{uname:<18} | note: {note}")
+            uname = _clean_log_str(pinfo.get("username") or users.get(uid, {}).get("username") or "unknown", 20)
+            note = _clean_log_str(notes.get(uid) or "-", 40)
+            lines.append(f"  ? id={uid:<12} | @{uname:<20} | note: {note}")
 
     lines.append(f"\nBLOCKED IDS ({len(blocked)}):")
     if not blocked:
         lines.append("  (none)")
     else:
         for uid, binfo in blocked.items():
-            uname = binfo.get("username") or users.get(uid, {}).get("username") or "unknown"
-            note = notes.get(uid) or binfo.get("note") or "-"
-            lines.append(f"  ! id={uid:<12} | @{uname:<18} | note: {note}")
+            uname = _clean_log_str(binfo.get("username") or users.get(uid, {}).get("username") or "unknown", 20)
+            note = _clean_log_str(notes.get(uid) or binfo.get("note") or "-", 40)
+            lines.append(f"  ! id={uid:<12} | @{uname:<20} | note: {note}")
 
     lines.append(f"\nREGISTERED USERS ({len(users)}):")
     if not users:
         lines.append("  (none)")
     else:
         for uid, udata in users.items():
-            uname = udata.get("username", "unknown")
+            uname = _clean_log_str(udata.get("username", "unknown"), 20)
             role = "admin" if (uid in admins or udata.get("is_admin")) else ("blocked" if uid in blocked else ("pending" if uid in pend else "user"))
-            note = notes.get(uid) or udata.get("admin_note") or "-"
-            lines.append(f"  - id={uid:<12} | @{uname:<18} | role={role:<8} | note: {note}")
+            note = _clean_log_str(notes.get(uid) or udata.get("admin_note") or "-", 40)
+            lines.append(f"  - id={uid:<12} | @{uname:<20} | role={role:<8} | note: {note}")
 
     lines.append("------------------------------------------------------------------------")
     return "\n".join(lines)
-
-
-def _write_db_and_stat_sync(snapshot_str: str, stat_str: str):
-    try:
-        tmp_db = DB_FILE + ".tmp"
-        with open(tmp_db, "w", encoding="utf-8") as f:
-            f.write(snapshot_str)
-        os.replace(tmp_db, DB_FILE)
-
-        tmp_stat = STAT_FILE + ".tmp"
-        with open(tmp_stat, "w", encoding="utf-8") as sf:
-            sf.write(stat_str)
-        os.replace(tmp_stat, STAT_FILE)
-    except Exception:
-        pass
 
 
 def _build_stat_report_str(data: dict) -> str:
@@ -632,14 +709,14 @@ def _build_stat_report_str(data: dict) -> str:
         m_val = udata.get("m_val", 0)
         m_lock = udata.get("m_lock", 0)
         rem_min = max(0, int((m_lock - time.time()) // 60)) if m_lock > time.time() else 0
-        uname = udata.get("username", f"ID_{uid}")
+        uname = _clean_log_str(udata.get("username", f"ID_{uid}"), 24)
         active_rems = len([r for r in udata.get("reminders", []) if not r.get("done")])
         d_limit = max(3, min(10, udata.get("dump_limit", 5)))
         grp = "forest" if udata.get("active_group") == "forest" else "projects"
         role_str = "admin" if is_user_admin(udata) else "user"
         u_used = get_user_used_bytes(udata)
         u_lim_str = "unlimited" if is_user_admin(udata) else fmt_mb(dyn_quota)
-        note = notes.get(uid) or udata.get("admin_note") or "-"
+        note = _clean_log_str(notes.get(uid) or udata.get("admin_note") or "-", 35)
 
         u_lines = [
             f"\nuser: @{uname} (id={uid}) | note={note} | role={role_str} | group={grp}",
@@ -647,7 +724,8 @@ def _build_stat_report_str(data: dict) -> str:
         ]
         for pid, p in projs.items():
             p_files = p.get("files", [])
-            u_lines.append(f"  project: \"{p.get('name', '')}\" (files={len(p_files)})")
+            p_name = _clean_log_str(p.get("name", ""), 40)
+            u_lines.append(f"  project: \"{p_name}\" (files={len(p_files)})")
             for p_idx in range(0, len(p_files), d_limit):
                 page_num = (p_idx // d_limit) + 1
                 chunk = p_files[p_idx:p_idx + d_limit]
@@ -655,7 +733,8 @@ def _build_stat_report_str(data: dict) -> str:
                 for offset, fitem in enumerate(chunk, 1):
                     f_num = p_idx + offset
                     f_sz = fmt_mb(_calc_file_item_bytes(fitem))
-                    u_lines.append(f"    #{f_num}: {fitem.get('name', 'unnamed')} ({f_sz}) [{fitem.get('date', '')}]")
+                    fn_clean = _clean_log_str(fitem.get("name", "unnamed"), 35)
+                    u_lines.append(f"    #{f_num}: {fn_clean} ({f_sz}) [{_clean_log_str(fitem.get('date', ''), 16)}]")
         user_blocks.extend(u_lines)
 
     pend_reqs = [r for r in data.get("project_requests", {}).values() if r.get("status") == "pending"]
@@ -664,6 +743,29 @@ def _build_stat_report_str(data: dict) -> str:
     lines.extend(user_blocks)
     lines.append("\n" + _build_console_admin_table(data) + "\n")
     return "\n".join(lines)
+
+
+def _serialize_and_write_sync(data_ref: dict):
+    try:
+        snapshot_str = json.dumps(data_ref, ensure_ascii=False, separators=(",", ":"))
+        stat_str = _build_stat_report_str(data_ref)
+        snap_b = snapshot_str.encode("utf-8")
+        stat_b = stat_str.encode("utf-8")
+
+        tmp_db = DB_FILE + ".tmp"
+        with open(tmp_db, "wb") as f:
+            f.write(snap_b)
+        os.replace(tmp_db, DB_FILE)
+
+        tmp_stat = STAT_FILE + ".tmp"
+        with open(tmp_stat, "wb") as sf:
+            sf.write(stat_b)
+        os.replace(tmp_stat, STAT_FILE)
+
+        _DISK_CACHE["bytes"] = max(_DISK_CACHE.get("bytes", 0), len(snap_b) + len(stat_b))
+        _DISK_CACHE["ts"] = time.time()
+    except Exception:
+        pass
 
 
 async def _async_flush_db():
@@ -676,10 +778,9 @@ async def _async_flush_db():
     async with _SAVE_LOCK:
         while True:
             _SAVE_PENDING = False
+            await asyncio.sleep(0.35)
             try:
-                snapshot_str = json.dumps(db, ensure_ascii=False, indent=2)
-                stat_str = _build_stat_report_str(db)
-                await asyncio.to_thread(_write_db_and_stat_sync, snapshot_str, stat_str)
+                await asyncio.to_thread(_serialize_and_write_sync, db)
             except Exception:
                 pass
             if not _SAVE_PENDING:
@@ -694,12 +795,7 @@ def save_db(sync_force: bool = False):
             return
     except RuntimeError:
         pass
-    try:
-        snapshot_str = json.dumps(db, ensure_ascii=False, indent=2)
-        stat_str = _build_stat_report_str(db)
-        _write_db_and_stat_sync(snapshot_str, stat_str)
-    except Exception:
-        pass
+    _serialize_and_write_sync(db)
 
 
 db = load_db()
@@ -714,8 +810,8 @@ def add_past_notification(u: dict, title: str, text: str):
     notifs = u.setdefault("notifications", [])
     notifs.insert(0, {
         "id": f"ntf_{uuid.uuid4().hex[:6]}",
-        "title": title[:40],
-        "text": text[:300],
+        "title": _clean_log_str(title, 40),
+        "text": _clean_log_str(text, 300),
         "date": datetime.now(MSK_TZ).strftime("%d.%m %H:%M"),
         "read": False
     })
@@ -743,12 +839,13 @@ def get_user(user_obj: types.User) -> dict:
     curr_sh_date = get_shanghai_date()
     now_ts = int(time.time())
     is_adm = uid in db.get("admins", {})
+    clean_uname = _clean_log_str(user_obj.username or user_obj.full_name or f"Участник_{uid}", 32)
 
     if uid not in db["users"]:
         pid = f"p_{uuid.uuid4().hex[:6]}"
         db["users"][uid] = {
             "id": uid,
-            "username": user_obj.username or user_obj.full_name or f"Участник_{uid}",
+            "username": clean_uname,
             "is_admin": is_adm,
             "admin_note": db.get("admin_notes", {}).get(uid, ""),
             "last_seen": now_ts,
@@ -797,7 +894,7 @@ def get_user(user_obj: types.User) -> dict:
 
     u = db["users"][uid]
     u["last_seen"] = now_ts
-    u["username"] = user_obj.username or user_obj.full_name or u.get("username", f"Участник_{uid}")
+    u["username"] = clean_uname or u.get("username", f"Участник_{uid}")
     if uid in db.get("admins", {}):
         u["is_admin"] = True
         db["admins"][uid]["username"] = u["username"]
@@ -822,12 +919,12 @@ def get_user(user_obj: types.User) -> dict:
             normalized_keys.append({
                 "id": f"k_{uuid.uuid4().hex[:6]}",
                 "name": f"Ключ №{idx}",
-                "key": encrypt_api_key(item)
+                "key": encrypt_api_key(item, uid=uid)
             })
         elif isinstance(item, dict) and "key" in item:
             item.setdefault("id", f"k_{uuid.uuid4().hex[:6]}")
             item.setdefault("name", f"Ключ №{idx}")
-            item["key"] = encrypt_api_key(item["key"])
+            item["key"] = encrypt_api_key(item["key"], uid=uid)
             normalized_keys.append(item)
     u["personal_keys"] = normalized_keys
     u.setdefault("key_cursor", 0)
@@ -955,17 +1052,23 @@ async def _purge_tracked_messages(
         u["anchor_msg_id"] = None
     if current_msg_id:
         to_delete.add(current_msg_id)
-        if deep_sweep:
-            for mid in range(max(1, current_msg_id - 16), current_msg_id + 2):
-                to_delete.add(mid)
 
     if anchor_id and anchor_id in to_delete:
         to_delete.remove(anchor_id)
 
     u["msg_ids"] = [anchor_id] if anchor_id else []
     u["last_msg_id"] = None
-    for mid in sorted(to_delete, reverse=True):
-        await _try_delete_msg(chat_id, mid)
+
+    sorted_ids = sorted([mid for mid in to_delete if isinstance(mid, int) and mid > 0], reverse=True)
+    if not sorted_ids:
+        return
+    try:
+        for i in range(0, len(sorted_ids), 95):
+            chunk = sorted_ids[i:i + 95]
+            await bot.delete_messages(chat_id=chat_id, message_ids=chunk)
+    except Exception:
+        for mid in sorted_ids[:10]:
+            await _try_delete_msg(chat_id, mid)
 
 
 def _cancel_user_timer(uid: str):
@@ -1048,7 +1151,7 @@ async def _ensure_anchor_kb(chat_id: int, u: dict, force_refresh: bool = False):
             raw_bar = ui.get("bar_forest") or f"🌲 Группа: Лес • Сборка v{BOT_VERSION}"
         else:
             raw_bar = ui.get("bar_proj") or f"🧭 Группа: Проекты • Сборка v{BOT_VERSION}"
-        bar_text = f"*{clean_dashes(raw_bar)}*"
+        bar_text = f"*{esc_md(clean_dashes(raw_bar))}*"
         try:
             sent = await bot.send_message(
                 chat_id=chat_id,
@@ -1196,8 +1299,8 @@ def get_welcome_text(u: dict) -> str:
         quota_line = f"💾 *Память аккаунта:* `{fmt_mb(u_used)}` из `{fmt_mb(dyn_quota)}` (Сервер: `{fmt_gb(srv_used)} / 5.00 ГБ`)"
 
     return (
-        f"*{ui['welcome_title']}*\n"
-        f"_{ui['welcome_desc']}_\n\n"
+        f"*{esc_md(ui['welcome_title'])}*\n"
+        f"_{esc_md(ui['welcome_desc'])}_\n\n"
         f"👤 *Именное удостоверение:* `{esc_md(u['username'])}`{note_str}\n"
         f"🛡 *Режим доступа:* `{role_badge}`\n"
         f"{quota_line}\n"
@@ -1258,59 +1361,83 @@ def split_into_pages(text: str, chunk_size: int = 700) -> list:
 
 def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
     fname = filename.lower()
+    if len(file_bytes) > MAX_DOC_DOWNLOAD_BYTES:
+        return "[Отклонено: размер файла превышает 10 МБ]"
+
     if fname.endswith((".md", ".txt", ".py", ".csv", ".html", ".xml", ".js", ".lua", ".luau")):
         return file_bytes.decode("utf-8", errors="ignore").strip()[:80000]
 
     if fname.endswith(".json"):
+        if len(file_bytes) > 2 * 1024 * 1024:
+            return file_bytes[:50000].decode("utf-8", errors="ignore")
         raw = file_bytes.decode("utf-8", errors="ignore")
         try:
             data = json.loads(raw)
             if isinstance(data, dict) and "items" in data:
                 lines = []
-                for idx, item in enumerate(data.get("items", []), 1):
+                for idx, item in enumerate(data.get("items", [])[:300], 1):
                     if item.get("user"):
-                        lines.append(f"Запись {idx} [Запрос]:\n{item['user']}")
+                        lines.append(f"Запись {idx} [Запрос]:\n{str(item['user'])[:2000]}")
                     if item.get("assistant"):
-                        lines.append(f"Запись {idx} [Ответ]:\n{item['assistant']}")
+                        lines.append(f"Запись {idx} [Ответ]:\n{str(item['assistant'])[:2000]}")
                 return "\n\n".join(lines)[:80000]
             elif isinstance(data, list):
-                lines = [f"[{i.get('role', 'запись')}]: {i.get('text', str(i))}" for i in data if isinstance(i, dict)]
+                lines = [f"[{i.get('role', 'запись')}]: {str(i.get('text', i))[:2000]}" for i in data[:300] if isinstance(i, dict)]
                 if lines:
                     return "\n\n".join(lines)[:80000]
         except Exception:
             pass
         return raw[:50000]
 
+    if fname.endswith((".docx", ".pptx")):
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+                infos = zf.infolist()
+                if len(infos) > 500:
+                    return "[Отклонено: превышено число объектов внутри архива документа]"
+                total_uncomp = sum(zi.file_size for zi in infos)
+                if total_uncomp > MAX_ZIP_UNCOMPRESSED_BYTES:
+                    return "[Отклонено: распакованный размер документа превышает лимит безопасности 25 МБ]"
+        except Exception:
+            return "[Не удалось проверить архив документа]"
+
     if fname.endswith(".pdf") and PdfReader is not None:
+        if file_bytes.count(b"/FlateDecode") > 400 or file_bytes.count(b"/ObjStm") > 200:
+            return "[Отклонено: документ содержит избыточное число сжатых потоков]"
         try:
             reader = PdfReader(io.BytesIO(file_bytes))
             pages_txt = []
-            for idx, page in enumerate(reader.pages, 1):
+            total_chars = 0
+            for idx, page in enumerate(reader.pages[:50], 1):
                 t = page.extract_text()
                 if t and t.strip():
-                    pages_txt.append(f"=== [Лист {idx}] ===\n{t.strip()}")
+                    block = f"=== [Лист {idx}] ===\n{t.strip()}"
+                    pages_txt.append(block)
+                    total_chars += len(block)
+                    if total_chars >= 80000:
+                        break
             return "\n\n".join(pages_txt)[:80000]
         except Exception as e:
-            return f"[Не удалось разобрать PDF: {e}]"
+            return f"[Не удалось разобрать PDF: {esc_md(e)}]"
 
     if fname.endswith(".docx") and docx is not None:
         try:
             doc = docx.Document(io.BytesIO(file_bytes))
-            paras = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-            for table in doc.tables:
-                for row in table.rows:
+            paras = [p.text.strip() for p in doc.paragraphs[:1500] if p.text.strip()]
+            for table in doc.tables[:50]:
+                for row in table.rows[:200]:
                     row_txt = " | ".join([cell.text.strip() for cell in row.cells if cell.text.strip()])
                     if row_txt:
                         paras.append(row_txt)
             return "\n\n".join(paras)[:80000]
         except Exception as e:
-            return f"[Не удалось разобрать DOCX: {e}]"
+            return f"[Не удалось разобрать DOCX: {esc_md(e)}]"
 
     if fname.endswith(".pptx") and Presentation is not None:
         try:
             prs = Presentation(io.BytesIO(file_bytes))
             slides_txt = []
-            for idx, slide in enumerate(prs.slides, 1):
+            for idx, slide in enumerate(list(prs.slides)[:100], 1):
                 s_lines = []
                 for shape in slide.shapes:
                     if hasattr(shape, "text") and shape.text.strip():
@@ -1319,8 +1446,57 @@ def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
                     slides_txt.append(f"=== [Слайд {idx}] ===\n" + "\n".join(s_lines))
             return "\n\n".join(slides_txt)[:80000]
         except Exception as e:
-            return f"[Не удалось разобрать PPTX: {e}]"
+            return f"[Не удалось разобрать PPTX: {esc_md(e)}]"
 
+    return ""
+
+
+def _child_extract_worker(file_bytes: bytes, fname: str, q_out):
+    try:
+        if resource is not None:
+            try:
+                resource.setrlimit(resource.RLIMIT_CPU, (7, 7))
+            except Exception:
+                pass
+        res = extract_text_from_bytes(file_bytes, fname)
+        q_out.put(res[:80000] if res else "")
+    except Exception as e:
+        q_out.put(f"[Ошибка разбора документа: {esc_md(e)}]")
+
+
+async def extract_text_isolated(file_bytes: bytes, fname: str, timeout_sec: float = 8.0) -> str:
+    if fname.lower().endswith((".md", ".txt", ".py", ".csv", ".html", ".xml", ".js", ".lua", ".luau")):
+        return file_bytes.decode("utf-8", errors="ignore").strip()[:80000]
+    try:
+        ctx = multiprocessing.get_context("fork")
+    except ValueError:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(extract_text_from_bytes, file_bytes, fname),
+                timeout=timeout_sec
+            )
+        except Exception:
+            return "[Превышено время разбора документа]"
+
+    q_out = ctx.Queue()
+    proc = ctx.Process(target=_child_extract_worker, args=(file_bytes, fname, q_out), daemon=True)
+    proc.start()
+    start_t = time.time()
+    while proc.is_alive():
+        if time.time() - start_t > timeout_sec:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            await asyncio.to_thread(proc.join, 1.0)
+            return "[Превышено время безопасного разбора документа]"
+        await asyncio.sleep(0.1)
+    await asyncio.to_thread(proc.join, 1.0)
+    try:
+        if not q_out.empty():
+            return q_out.get_nowait()
+    except Exception:
+        pass
     return ""
 
 
@@ -1853,6 +2029,39 @@ async def _run_outro_sequence(chat_id: int, uid: str):
         pass
 
 
+def _is_user_locked(u: dict) -> int:
+    lock_until = u.get("m_lock", 0)
+    now_ts = int(time.time())
+    if lock_until > now_ts:
+        return max(1, (lock_until - now_ts + 59) // 60)
+    if lock_until != 0:
+        u["m_lock"] = 0
+        save_db()
+    return 0
+
+
+def _is_in_active_stage_or_locked_cb(callback: types.CallbackQuery) -> bool:
+    if not callback.from_user:
+        return False
+    u = get_user(callback.from_user)
+    if _is_user_locked(u) > 0:
+        return True
+    if u.get("m_active", False):
+        data = callback.data or ""
+        phase = u.get("m_phase")
+        if phase == "heart" and data.startswith("hb_"):
+            return False
+        if phase == "dialogues" and data in ("pdlg_agree", "pdlg_refuse"):
+            return False
+        return True
+    return False
+
+
+@dp.callback_query(_is_in_active_stage_or_locked_cb, StateFilter("*"))
+async def intercept_stage_or_lock_cb(callback: types.CallbackQuery):
+    await callback.answer()
+
+
 @dp.callback_query(F.data.in_(["pdlg_agree", "pdlg_refuse"]), StateFilter("*"))
 async def handle_seq_choice_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
@@ -1885,17 +2094,6 @@ async def handle_canvas_cb(callback: types.CallbackQuery, state: FSMContext):
         act = "pray"
     await callback.answer()
     await _apply_canvas_input(callback.message.chat.id, u, state, act)
-
-
-def _is_user_locked(u: dict) -> int:
-    lock_until = u.get("m_lock", 0)
-    now_ts = int(time.time())
-    if lock_until > now_ts:
-        return max(1, (lock_until - now_ts + 59) // 60)
-    if lock_until != 0:
-        u["m_lock"] = 0
-        save_db()
-    return 0
 
 
 async def _perform_full_reset(chat_id: int, u: dict, state: FSMContext, user_msg_id: int = None):
@@ -1932,54 +2130,87 @@ async def _perform_full_reset(chat_id: int, u: dict, state: FSMContext, user_msg
     _track_msg_id(u, sent.message_id)
     save_db()
 
-# === НАЧАЛО ЧАСТИ 2 ===
-def _validate_safe_url(url: str) -> tuple:
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+_BENCH_NET = ipaddress.ip_network("198.18.0.0/15")
+
+
+def _check_ip_obj_safe(ip_str: str) -> bool:
     try:
-        parsed = urllib.parse.urlparse(url.strip())
-        if parsed.scheme not in ("http", "https"):
-            return False, "Недопустимый протокол (разрешены только http/https)."
-        hostname = parsed.hostname
-        if not hostname:
-            return False, "Не указан хост."
-        if parsed.port not in (None, 80, 443):
-            return False, "Недопустимый порт."
-        host_low = hostname.lower()
-        if host_low in ("localhost", "0.0.0.0", "127.0.0.1", "::1") or host_low.endswith((".local", ".internal", ".lan")):
-            return False, "Локальные адреса запрещены."
-
-        addr_info = socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
-        for item in addr_info:
-            ip_str = item[4][0]
-            ip_obj = ipaddress.ip_address(ip_str)
-            if (
-                ip_obj.is_private
-                or ip_obj.is_loopback
-                or ip_obj.is_link_local
-                or ip_obj.is_multicast
-                or ip_obj.is_reserved
-                or ip_obj.is_unspecified
-            ):
-                return False, "Доступ к внутренним и приватным сетям запрещён."
-        return True, ""
-    except Exception as e:
-        return False, f"Ошибка проверки адреса: {e}"
+        ip_obj = ipaddress.ip_address(ip_str)
+        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
+            ip_obj = ip_obj.ipv4_mapped
+        if (
+            not ip_obj.is_global
+            or ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+        ):
+            return False
+        if isinstance(ip_obj, ipaddress.IPv4Address):
+            if ip_obj in _CGNAT_NET or ip_obj in _BENCH_NET:
+                return False
+        return True
+    except Exception:
+        return False
 
 
-async def _fetch_url_bounded(session: aiohttp.ClientSession, url: str, max_bytes: int = MAX_WEB_IMPORT_BYTES) -> bytes:
-    is_safe, reason = await asyncio.to_thread(_validate_safe_url, url)
-    if not is_safe:
-        raise ValueError(reason)
-    async with session.get(url, timeout=15, allow_redirects=False) as resp:
-        if resp.status in (301, 302, 303, 307, 308):
-            raise ValueError("Перенаправления (редиректы) отключены в целях безопасности.")
-        if resp.status != 200:
-            raise ValueError(f"Код ответа сервера: HTTP {resp.status}")
-        buf = bytearray()
-        async for chunk in resp.content.iter_chunked(16384):
-            buf.extend(chunk)
-            if len(buf) > max_bytes:
-                break
-        return bytes(buf[:max_bytes])
+class _SafePinnedResolver(AbstractResolver):
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET):
+        host_low = (host or "").strip().lower()
+        if not host_low or host_low in ("localhost", "0.0.0.0", "127.0.0.1", "::1") or host_low.endswith((".local", ".internal", ".lan")):
+            raise ValueError("Доступ к локальным узлам запрещён.")
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, port, family, socket.SOCK_STREAM)
+        results = []
+        for fam, _, proto, _, sockaddr in infos:
+            ip_str = sockaddr[0]
+            if not _check_ip_obj_safe(ip_str):
+                raise ValueError(f"Заблокирован доступ к внутреннему адресу: {ip_str}")
+            results.append({
+                "hostname": host,
+                "host": ip_str,
+                "port": sockaddr[1],
+                "family": fam,
+                "proto": proto,
+                "flags": socket.AI_NUMERICHOST
+            })
+        if not results:
+            raise ValueError("Не удалось разрешить адрес хоста.")
+        return results
+
+    async def close(self):
+        pass
+
+
+async def _fetch_url_bounded(url: str, max_bytes: int = MAX_WEB_IMPORT_BYTES) -> bytes:
+    parsed = urllib.parse.urlparse(url.strip())
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Разрешены только протоколы http и https.")
+    if not parsed.hostname:
+        raise ValueError("Не указан хост.")
+    if parsed.port not in (None, 80, 443):
+        raise ValueError("Недопустимый порт.")
+
+    connector = aiohttp.TCPConnector(
+        resolver=_SafePinnedResolver(),
+        family=socket.AF_INET,
+        force_close=True
+    )
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+        async with session.get(url, timeout=15, allow_redirects=False) as resp:
+            if resp.status in (301, 302, 303, 307, 308):
+                raise ValueError("Перенаправления (редиректы) отключены в целях безопасности.")
+            if resp.status != 200:
+                raise ValueError(f"Код ответа сервера: HTTP {resp.status}")
+            buf = bytearray()
+            async for chunk in resp.content.iter_chunked(16384):
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    break
+            return bytes(buf[:max_bytes])
 
 
 def build_project_context(proj: dict, u: dict, max_chars: int = 120000) -> str:
@@ -2057,7 +2288,7 @@ async def ask_gemini_with_rotation(u: dict, proj: dict, user_prompt: str, photo_
 
     async with aiohttp.ClientSession() as session:
         for k_offset, key_obj in enumerate(ordered_keys):
-            api_key = decrypt_api_key(key_obj["key"]).strip()
+            api_key = decrypt_api_key(key_obj["key"], uid=u["id"]).strip()
             if not api_key:
                 continue
             key_name = esc_md(key_obj.get("name", f"Ключ №{k_offset+1}"))
@@ -2193,7 +2424,7 @@ async def fetch_external_feeds(country_query: str) -> str:
 
     lines = [f"_{atmo}_\n\n📡 *частота: {label}*\n"]
     for idx, (title, link, pub) in enumerate(items_collected[:7], 1):
-        if link and link.startswith(("http://", "https://")):
+        if link and link.startswith(("http://", "https://")) and ")" not in link and "\\" not in link:
             lines.append(f"{idx}. [{title}]({link}) _{pub}_")
         else:
             lines.append(f"{idx}. *{title}* _{pub}_")
@@ -2307,18 +2538,18 @@ async def _exec_console_admin_cmd(raw_line: str) -> str:
             return f"[sys.core.admin] error: usage -> admin {sub} <tg_id> [note]"
         uid = tokens[1].strip()
         if not uid.isdigit():
-            return f"[sys.core.admin] error: invalid tg_id '{uid}' (must be digits)"
+            return f"[sys.core.admin] error: invalid tg_id '{_clean_log_str(uid)}' (must be digits)"
         if sub == "accept" and uid not in pend and uid not in users:
             return f"[sys.core.admin] error: id={uid} has no pending request"
 
-        note_val = " ".join(tokens[2:]).strip() if len(tokens) > 2 else notes.get(uid, "")
+        note_val = _clean_log_str(" ".join(tokens[2:]).strip(), 40) if len(tokens) > 2 else notes.get(uid, "")
         if note_val:
             notes[uid] = note_val
 
         blocked.pop(uid, None)
         p_info = pend.pop(uid, {})
         u_obj = users.get(uid)
-        uname = (u_obj.get("username") if u_obj else None) or p_info.get("username") or f"ID_{uid}"
+        uname = _clean_log_str((u_obj.get("username") if u_obj else None) or p_info.get("username") or f"ID_{uid}", 24)
 
         admins[uid] = {
             "uid": uid,
@@ -2339,7 +2570,7 @@ async def _exec_console_admin_cmd(raw_line: str) -> str:
 
         if bot is not None and u_obj:
             try:
-                await _ensure_anchor_kb(int(uid), u_obj, force_refresh=True)
+                await _ensure_anchor_kb(int(uid), u_obj, force_refresh=False)
                 sent = await bot.send_message(
                     chat_id=int(uid),
                     text="👑 *Доступ подтверждён.*\nДля вашего аккаунта активирован полный режим.",
@@ -2356,7 +2587,9 @@ async def _exec_console_admin_cmd(raw_line: str) -> str:
         if len(tokens) < 3:
             return "[sys.core.admin] error: usage -> admin rename <tg_id> <note>"
         uid = tokens[1].strip()
-        note_val = " ".join(tokens[2:]).strip()
+        if not uid.isdigit():
+            return "[sys.core.admin] error: tg_id must be digits"
+        note_val = _clean_log_str(" ".join(tokens[2:]).strip(), 40)
         notes[uid] = note_val
         if uid in admins:
             admins[uid]["note"] = note_val
@@ -2378,19 +2611,21 @@ async def _exec_console_admin_cmd(raw_line: str) -> str:
             users[uid]["is_admin"] = False
         save_db()
         if existed:
-            return f"[sys.core.admin] ok: admin privileges revoked for id={uid}"
-        return f"[sys.core.admin] info: id={uid} was not in admin list"
+            return f"[sys.core.admin] ok: admin privileges revoked for id={_clean_log_str(uid)}"
+        return f"[sys.core.admin] info: id={_clean_log_str(uid)} was not in admin list"
 
     if sub == "block":
         if len(tokens) < 2:
             return "[sys.core.admin] error: usage -> admin block <tg_id> [note]"
         uid = tokens[1].strip()
-        note_val = " ".join(tokens[2:]).strip() if len(tokens) > 2 else notes.get(uid, "")
+        if not uid.isdigit():
+            return "[sys.core.admin] error: tg_id must be digits"
+        note_val = _clean_log_str(" ".join(tokens[2:]).strip(), 40) if len(tokens) > 2 else notes.get(uid, "")
         if note_val:
             notes[uid] = note_val
         admins.pop(uid, None)
         pend.pop(uid, None)
-        uname = users.get(uid, {}).get("username", f"ID_{uid}")
+        uname = _clean_log_str(users.get(uid, {}).get("username", f"ID_{uid}"), 24)
         if uid in users:
             users[uid]["is_admin"] = False
         blocked[uid] = {
@@ -2447,7 +2682,6 @@ async def _notify_admins_about_project_req(req_obj: dict):
             f"От @{requester_name} (ID {requester_uid}) на создание проекта «{proj_name}»"
         )
         try:
-            await _ensure_anchor_kb(int(adm_uid), adm_user, force_refresh=True)
             sent = await bot.send_message(
                 chat_id=int(adm_uid),
                 text=alert_text,
@@ -2485,6 +2719,32 @@ async def _stdin_console_listener():
             await asyncio.sleep(5)
 
 
+async def _ipc_admin_watcher():
+    while True:
+        try:
+            await asyncio.sleep(0.35)
+            if os.path.exists(ADMIN_CMD_FILE):
+                try:
+                    with open(ADMIN_CMD_FILE, "r", encoding="utf-8") as cf:
+                        q_lines = [ln.strip() for ln in cf.read().splitlines() if ln.strip()]
+                    os.remove(ADMIN_CMD_FILE)
+                    out_blocks = []
+                    for q_cmd in q_lines:
+                        out_msg = await _exec_console_admin_cmd(q_cmd)
+                        if out_msg:
+                            out_blocks.append(out_msg)
+                            print(out_msg, flush=True)
+                    if out_blocks:
+                        with open(ADMIN_ACK_FILE, "w", encoding="utf-8") as af:
+                            af.write("\n".join(out_blocks) + "\n")
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(1)
+
+
 async def _reminders_daemon():
     while True:
         try:
@@ -2497,18 +2757,6 @@ async def _reminders_daemon():
                 for raw_id in re.split(r"[,;\s]+", env_admins.strip()):
                     if raw_id and raw_id.isdigit() and raw_id not in db.get("admins", {}):
                         await _exec_console_admin_cmd(f"admin add {raw_id} env_admin")
-
-            if os.path.exists(ADMIN_CMD_FILE):
-                try:
-                    with open(ADMIN_CMD_FILE, "r", encoding="utf-8") as cf:
-                        q_lines = [ln.strip() for ln in cf.read().splitlines() if ln.strip()]
-                    os.remove(ADMIN_CMD_FILE)
-                    for q_cmd in q_lines:
-                        out_msg = await _exec_console_admin_cmd(q_cmd)
-                        if out_msg:
-                            print(out_msg, flush=True)
-                except Exception:
-                    pass
 
             for uid, udata in list(db.get("users", {}).items()):
                 last_seen = udata.get("last_seen", now_ts)
@@ -2526,6 +2774,8 @@ async def _reminders_daemon():
                         comment = esc_md(clean_dashes(r.get("comment", "Без комментария")))
                         dt_label = esc_md(r.get("dt_label", ""))
                         files_attached = r.get("files", [])
+                        proj_obj = udata.get("projects", {}).get(r.get("proj_id", ""), {})
+                        proj_files = proj_obj.get("files", [])
 
                         add_past_notification(
                             udata,
@@ -2564,17 +2814,22 @@ async def _reminders_daemon():
                                         caption=f"📎 {fitem.get('name', 'Документ')} (по вашему поручению)"
                                     )
                                     _track_msg_id(udata, s_f.message_id)
-                                elif fitem.get("extracted_text"):
-                                    buf = BufferedInputFile(
-                                        fitem["extracted_text"].encode("utf-8"),
-                                        filename=f"{fitem.get('name', 'note')}.md"
-                                    )
-                                    s_f = await bot.send_document(
-                                        chat_id=chat_id,
-                                        document=buf,
-                                        caption=f"📄 {fitem.get('name', 'Запись')} (по вашему поручению)"
-                                    )
-                                    _track_msg_id(udata, s_f.message_id)
+                                else:
+                                    f_idx = fitem.get("file_idx")
+                                    note_txt = ""
+                                    if isinstance(f_idx, int) and 0 <= f_idx < len(proj_files):
+                                        note_txt = proj_files[f_idx].get("extracted_text", "")
+                                    if note_txt:
+                                        buf = BufferedInputFile(
+                                            note_txt.encode("utf-8"),
+                                            filename=f"{fitem.get('name', 'note')}.md"
+                                        )
+                                        s_f = await bot.send_document(
+                                            chat_id=chat_id,
+                                            document=buf,
+                                            caption=f"📄 {fitem.get('name', 'Запись')} (по вашему поручению)"
+                                        )
+                                        _track_msg_id(udata, s_f.message_id)
                         except Exception as e:
                             if _is_block_error(e):
                                 await _exec_hard_purge(uid)
@@ -2680,17 +2935,19 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
             await safe_answer(message, "Окей. Доступ уже активен.", u=u)
             return
 
+        already_pending = uid_str in db.get("pending_admins", {})
         db.setdefault("pending_admins", {})[uid_str] = {
             "uid": uid_str,
-            "username": u["username"],
+            "username": _clean_log_str(u["username"], 24),
             "ts": int(time.time())
         }
         save_db()
-        print(
-            f"[sys.core.admin] request from id={uid_str} (@{u['username']}) "
-            f"-> use: admin accept {uid_str} | admin block {uid_str}",
-            flush=True
-        )
+        if not already_pending:
+            print(
+                f"[sys.core.admin] request from id={uid_str} (@{_clean_log_str(u['username'], 24)}) "
+                f"-> use: admin accept {uid_str} | admin block {uid_str}",
+                flush=True
+            )
         await safe_answer(message, "Окей. Ждите...", u=u)
         return
 
@@ -2701,6 +2958,7 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
     if _is_user_locked(u) > 0:
         await _try_delete_msg(message.chat.id, message.message_id)
         return
+
     if u.get("m_active"):
         await _handle_grid_or_stage_input(message, state, u)
         return
@@ -2714,7 +2972,7 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
         u["f_ext_a"] = True
         u["active_group"] = "forest"
         if arg:
-            u["ext_a_loc"] = arg
+            u["ext_a_loc"] = _clean_log_str(arg, 40)
         elif not u.get("ext_a_loc"):
             u["ext_a_loc"] = "Russia"
         save_db()
@@ -2801,6 +3059,23 @@ async def cancel_state_cb(callback: types.CallbackQuery, state: FSMContext):
     await safe_edit(callback.message, get_welcome_text(u))
 
 
+def _resolve_shared_pkg(share_id: str) -> tuple:
+    meta = db.get("shared_links", {}).get(share_id)
+    if not meta:
+        return None, [], []
+    owner_uid = str(meta.get("author_id", ""))
+    proj_id = meta.get("proj_id", "")
+    owner_u = db.get("users", {}).get(owner_uid, {})
+    src_proj = owner_u.get("projects", {}).get(proj_id)
+    if not src_proj:
+        return None, [], []
+    files = copy.deepcopy(src_proj.get("files", []))
+    for f in files:
+        f.pop("pages", None)
+    hist = copy.deepcopy(src_proj.get("ai_history", [])[-MAX_AI_HISTORY_ITEMS:])
+    return src_proj, files, hist
+
+
 @dp.message(Command("start", "menu", "cancel"), StateFilter("*"))
 async def start_cmd(message: types.Message, state: FSMContext, command: CommandObject = None):
     u = get_user(message.from_user)
@@ -2809,25 +3084,24 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
 
     if command and command.args and command.args.startswith("share_"):
         share_id = command.args.replace("share_", "").strip()
-        shared_pkg = db.get("shared_links", {}).get(share_id)
-        if shared_pkg:
-            pkg_files = [dict(f) for f in shared_pkg.get("files", [])]
-            pkg_hist = [dict(h) for h in shared_pkg.get("ai_history", [])][-MAX_AI_HISTORY_ITEMS:]
+        shared_meta = db.get("shared_links", {}).get(share_id)
+        src_proj, pkg_files, pkg_hist = _resolve_shared_pkg(share_id)
+        if shared_meta and src_proj:
             added_bytes = sum(_calc_file_item_bytes(f) for f in pkg_files) + sum(len((h.get("text", "") or "").encode("utf-8")) for h in pkg_hist)
             ok_st, err_st = check_storage_allowance(u, added_bytes)
             if not ok_st:
                 await safe_answer(message, err_st, u=u, refresh_anchor=True)
                 return
 
-            safe_pkg_name = esc_md(shared_pkg["name"])
-            safe_author = esc_md(shared_pkg.get("author", "партнёра"))
+            safe_pkg_name = esc_md(src_proj.get("name", shared_meta.get("name", "Проект")))
+            safe_author = esc_md(shared_meta.get("author", "партнёра"))
 
             if is_user_admin(u):
                 new_pid = f"p_{uuid.uuid4().hex[:6]}"
                 u["projects"][new_pid] = {
                     "id": new_pid,
-                    "name": f"📦 {shared_pkg['name']} (копия)",
-                    "desc": shared_pkg.get("desc", "Получено по прямой ссылке"),
+                    "name": f"📦 {safe_pkg_name} (копия)",
+                    "desc": esc_md(src_proj.get("desc", "Получено по прямой ссылке")),
                     "created": datetime.now().strftime("%d.%m.%Y"),
                     "files": pkg_files,
                     "active_file": 0,
@@ -2857,15 +3131,27 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
                 )
                 return
             else:
+                my_pend = [
+                    r for r in db.get("project_requests", {}).values()
+                    if str(r.get("uid")) == u["id"] and r.get("status") == "pending"
+                ]
+                if my_pend:
+                    await safe_answer(
+                        message,
+                        "⏳ *У вас уже есть одна заявка на рассмотрении у администратора.* Дождитесь её решения перед отправкой следующей.",
+                        u=u,
+                        refresh_anchor=True
+                    )
+                    return
+
                 req_id = f"req_{uuid.uuid4().hex[:6]}"
                 req_obj = {
                     "id": req_id,
                     "uid": u["id"],
                     "username": u["username"],
-                    "name": f"📦 {shared_pkg['name']} (копия)",
-                    "desc": shared_pkg.get("desc", "Получено по прямой ссылке"),
-                    "files": pkg_files,
-                    "ai_history": pkg_hist,
+                    "name": f"📦 {safe_pkg_name} (копия)",
+                    "desc": esc_md(src_proj.get("desc", "Получено по прямой ссылке")),
+                    "share_id": share_id,
                     "status": "pending",
                     "created": datetime.now().strftime("%d.%m %H:%M")
                 }
@@ -3176,9 +3462,6 @@ async def show_ext_a_hub(message: types.Message, u: dict, edit_existing: bool = 
 @dp.callback_query(F.data.startswith("nw_set_"))
 async def switch_news_country_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     country = callback.data.replace("nw_set_", "")
     u["ext_a_loc"] = country
     save_db()
@@ -3188,10 +3471,6 @@ async def switch_news_country_cb(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "nw_custom")
 async def custom_news_country_start(callback: types.CallbackQuery, state: FSMContext):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     await state.set_state(HubStates.ext_a_custom_loc)
     await safe_edit(
         callback.message,
@@ -3206,7 +3485,7 @@ async def custom_news_country_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     await state.clear()
     if message.text:
-        u["ext_a_loc"] = message.text.strip()[:40]
+        u["ext_a_loc"] = _clean_log_str(message.text.strip(), 40)
         save_db()
     if _eval_telemetry_step(u):
         await _dispatch_grid_view(message, u, start_new_series=True)
@@ -3227,9 +3506,6 @@ async def show_ext_b_hub(message: types.Message, u: dict, edit_existing: bool = 
 @dp.callback_query(F.data == "dec_reroll")
 async def dec_reroll_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     await callback.answer("...шестерни провернулись...")
     await show_ext_b_hub(callback.message, u, edit_existing=True)
 
@@ -3244,10 +3520,6 @@ async def dec_back_main_cb(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("dec_menu_"))
 async def dec_tool_submenu_cb(callback: types.CallbackQuery):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     tool = callback.data.replace("dec_menu_", "")
     atmo = _pick_header_line("dec")
 
@@ -3286,10 +3558,6 @@ async def dec_tool_submenu_cb(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("cop_"))
 async def start_cipher_operation_cb(callback: types.CallbackQuery, state: FSMContext):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     op_code = callback.data.replace("cop_", "")
     await state.update_data(cipher_op=op_code)
     await state.set_state(HubStates.cipher_input)
@@ -3475,15 +3743,18 @@ async def approve_project_req_cb(callback: types.CallbackQuery):
     target_uid = str(req_obj["uid"])
     target_u = db.get("users", {}).get(target_uid)
     if target_u:
-        req_files = req_obj.get("files", [])
-        req_hist = req_obj.get("ai_history", [])
+        if req_obj.get("share_id"):
+            _, req_files, req_hist = _resolve_shared_pkg(req_obj["share_id"])
+        else:
+            req_files = copy.deepcopy(req_obj.get("files", []))
+            req_hist = copy.deepcopy(req_obj.get("ai_history", []))
         needed_bytes = sum(_calc_file_item_bytes(f) for f in req_files) + sum(len((h.get("text", "") or "").encode("utf-8")) for h in req_hist)
-        ok_st, err_st = check_storage_allowance(target_u, needed_bytes)
+        ok_st, _ = check_storage_allowance(target_u, needed_bytes)
         if not ok_st:
             await callback.answer("⚠️ У пользователя превышен лимит памяти!", show_alert=True)
             return
 
-        req_obj["status"] = "approved"
+        db.get("project_requests", {}).pop(req_id, None)
         pid = f"p_{uuid.uuid4().hex[:6]}"
         target_u["projects"][pid] = {
             "id": pid,
@@ -3505,7 +3776,7 @@ async def approve_project_req_cb(callback: types.CallbackQuery):
         )
         save_db()
         try:
-            await _ensure_anchor_kb(int(target_uid), target_u, force_refresh=True)
+            await _ensure_anchor_kb(int(target_uid), target_u, force_refresh=False)
             sent = await bot.send_message(
                 chat_id=int(target_uid),
                 text=(
@@ -3519,6 +3790,9 @@ async def approve_project_req_cb(callback: types.CallbackQuery):
             save_db()
         except Exception:
             pass
+    else:
+        db.get("project_requests", {}).pop(req_id, None)
+        save_db()
 
     await callback.answer("✅ Проект одобрен и создан!", show_alert=True)
     await safe_edit(
@@ -3538,12 +3812,11 @@ async def reject_project_req_cb(callback: types.CallbackQuery):
         await callback.answer("Только администратор может отклонять заявки!", show_alert=True)
         return
     req_id = callback.data.replace("apj_no_", "")
-    req_obj = db.get("project_requests", {}).get(req_id)
-    if not req_obj or req_obj.get("status") != "pending":
+    req_obj = db.get("project_requests", {}).pop(req_id, None)
+    if not req_obj:
         await callback.answer("Заявка уже обработана или не найдена.", show_alert=True)
         return
 
-    req_obj["status"] = "rejected"
     target_uid = str(req_obj["uid"])
     target_u = db.get("users", {}).get(target_uid)
     safe_name = esc_md(req_obj["name"])
@@ -3555,7 +3828,7 @@ async def reject_project_req_cb(callback: types.CallbackQuery):
         )
         save_db()
         try:
-            await _ensure_anchor_kb(int(target_uid), target_u, force_refresh=True)
+            await _ensure_anchor_kb(int(target_uid), target_u, force_refresh=False)
             sent = await bot.send_message(
                 chat_id=int(target_uid),
                 text=(
@@ -3569,6 +3842,8 @@ async def reject_project_req_cb(callback: types.CallbackQuery):
             save_db()
         except Exception:
             pass
+    else:
+        save_db()
 
     await callback.answer("❌ Заявка отклонена", show_alert=True)
     await safe_edit(
@@ -3584,9 +3859,6 @@ async def reject_project_req_cb(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "sch_menu")
 async def open_schedule_menu_cb(callback: types.CallbackQuery, state: FSMContext):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     await state.clear()
     await render_schedule_menu(callback.message, u, edit_existing=True)
     await callback.answer()
@@ -3616,7 +3888,7 @@ async def render_schedule_menu(message: types.Message, u: dict, edit_existing: b
         f"📅 *РАСПИСАНИЕ И КУРЬЕРСКАЯ СЛУЖБА КОНТОРЫ*\n"
         f"Точное время конторы (МСК): `{now_msk_str}`\n"
         f"Текущее дело: *{esc_md(proj['name'])}*\n\n"
-        f"• Поручений в очереди: *{len(pending)}*\n"
+        f"• Поручений в очереди: *{len(pending)} из {MAX_REMINDERS_PER_USER}*\n"
         f"• Вы можете отметить галочками нужные документы из архива, оставить резолюцию, и в назначенный час контора доставит их вам прямо в руки:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -3661,6 +3933,8 @@ async def fire_schedule_item_now_cb(callback: types.CallbackQuery):
     rems = u.get("reminders", [])
     if 0 <= idx < len(rems):
         r = rems[idx]
+        proj_obj = u.get("projects", {}).get(r.get("proj_id", ""), {})
+        proj_files = proj_obj.get("files", [])
         for fitem in r.get("files", []):
             if fitem.get("type") == "photo" and fitem.get("file_id"):
                 sent = await callback.message.answer_photo(fitem["file_id"], caption=f"📸 {fitem.get('name', '')}")
@@ -3668,10 +3942,15 @@ async def fire_schedule_item_now_cb(callback: types.CallbackQuery):
             elif fitem.get("file_id"):
                 sent = await callback.message.answer_document(fitem["file_id"], caption=f"📎 {fitem.get('name', '')}")
                 _track_msg_id(u, sent.message_id)
-            elif fitem.get("extracted_text"):
-                buf = BufferedInputFile(fitem["extracted_text"].encode("utf-8"), filename=f"{fitem.get('name', 'note')}.md")
-                sent = await callback.message.answer_document(buf)
-                _track_msg_id(u, sent.message_id)
+            else:
+                f_idx = fitem.get("file_idx")
+                note_txt = ""
+                if isinstance(f_idx, int) and 0 <= f_idx < len(proj_files):
+                    note_txt = proj_files[f_idx].get("extracted_text", "")
+                if note_txt:
+                    buf = BufferedInputFile(note_txt.encode("utf-8"), filename=f"{fitem.get('name', 'note')}.md")
+                    sent = await callback.message.answer_document(buf)
+                    _track_msg_id(u, sent.message_id)
         save_db()
     await callback.answer("Бумаги поданы на стол!")
 
@@ -3716,8 +3995,9 @@ def _build_file_selector_kb(proj: dict, selected_indices: list) -> InlineKeyboar
 @dp.callback_query(F.data == "sch_new")
 async def sch_new_start_cb(callback: types.CallbackQuery, state: FSMContext):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
+    active_rems = [r for r in u.get("reminders", []) if not r.get("done")]
+    if len(active_rems) >= MAX_REMINDERS_PER_USER and not is_user_admin(u):
+        await callback.answer(f"⚠️ Достигнут лимит активных напоминаний ({MAX_REMINDERS_PER_USER} шт.)!", show_alert=True)
         return
     proj = get_active_project(u)
     await state.set_state(HubStates.sch_select_files)
@@ -3788,7 +4068,7 @@ async def sch_to_comment_step_cb(callback: types.CallbackQuery, state: FSMContex
 @dp.message(HubStates.sch_comment)
 async def sch_comment_done_msg(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
-    comment = (message.text or "").strip()[:250] or "Деловое напоминание"
+    comment = esc_md((message.text or "").strip()[:250] or "Деловое напоминание")
     await state.update_data(rem_comment=comment)
     await state.set_state(HubStates.sch_datetime)
 
@@ -3821,8 +4101,13 @@ async def sch_comment_done_msg(message: types.Message, state: FSMContext):
 async def _finalize_reminder_creation(message: types.Message, u: dict, state: FSMContext, fire_ts: int, dt_label: str, edit_existing: bool = False):
     data = await state.get_data()
     await state.clear()
+    u["reminders"] = [r for r in u.get("reminders", []) if not r.get("done")][-MAX_REMINDERS_PER_USER:]
+    if len(u["reminders"]) >= MAX_REMINDERS_PER_USER and not is_user_admin(u):
+        await render_schedule_menu(message, u, edit_existing=edit_existing)
+        return
+
     proj = get_active_project(u)
-    sel_indices = data.get("sel_files", [])
+    sel_indices = data.get("sel_files", [])[:15]
     comment = data.get("rem_comment", "Деловое напоминание")
 
     attached_files = []
@@ -3830,13 +4115,13 @@ async def _finalize_reminder_creation(message: types.Message, u: dict, state: FS
         if 0 <= idx < len(proj["files"]):
             f = proj["files"][idx]
             attached_files.append({
+                "file_idx": idx,
                 "type": f.get("type", "doc"),
                 "file_id": f.get("file_id"),
-                "name": f.get("name", "Файл"),
-                "extracted_text": f.get("extracted_text", "")[:15000] if not f.get("file_id") else ""
+                "name": f.get("name", "Файл")
             })
 
-    u.setdefault("reminders", []).append({
+    u["reminders"].append({
         "id": f"rem_{uuid.uuid4().hex[:6]}",
         "proj_id": proj["id"],
         "proj_name": proj["name"],
@@ -3897,19 +4182,27 @@ async def sch_custom_datetime_msg(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "p_share_link")
 async def generate_share_link_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     proj = get_active_project(u)
-    share_id = uuid.uuid4().hex[:10]
+    shared_links = db.setdefault("shared_links", {})
 
-    db.setdefault("shared_links", {})[share_id] = {
+    share_id = None
+    for k_sh, v_sh in shared_links.items():
+        if str(v_sh.get("author_id")) == u["id"] and v_sh.get("proj_id") == proj["id"]:
+            share_id = k_sh
+            break
+
+    if not share_id:
+        user_links = [k for k, v in shared_links.items() if str(v.get("author_id")) == u["id"]]
+        if len(user_links) >= MAX_SHARE_LINKS_PER_USER and not is_user_admin(u):
+            shared_links.pop(user_links[0], None)
+        share_id = uuid.uuid4().hex[:10]
+
+    shared_links[share_id] = {
+        "proj_id": proj["id"],
         "name": proj["name"],
         "desc": proj.get("desc", ""),
         "author": u["username"],
         "author_id": u["id"],
-        "files": [dict(f) for f in proj.get("files", [])],
-        "ai_history": [dict(h) for h in proj.get("ai_history", [])][-MAX_AI_HISTORY_ITEMS:],
         "created": datetime.now().strftime("%d.%m.%Y %H:%M")
     }
     save_db()
@@ -3937,9 +4230,6 @@ async def generate_share_link_cb(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("psel_"))
 async def select_proj_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     pid = callback.data.replace("psel_", "")
     if pid in u["projects"]:
         u["active_project"] = pid
@@ -3951,9 +4241,14 @@ async def select_proj_cb(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "p_new")
 async def new_proj_start(callback: types.CallbackQuery, state: FSMContext):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
+    if not is_user_admin(u):
+        my_pend = [
+            r for r in db.get("project_requests", {}).values()
+            if str(r.get("uid")) == u["id"] and r.get("status") == "pending"
+        ]
+        if my_pend:
+            await callback.answer("⏳ У вас уже есть активная заявка на рассмотрении у администратора!", show_alert=True)
+            return
     await state.set_state(HubStates.new_proj_name)
     if is_user_admin(u):
         prompt_txt = "📁 Назовите *имя нового проекта или дела*, уважаемый:"
@@ -3973,7 +4268,7 @@ async def new_proj_start(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(HubStates.new_proj_name)
 async def new_proj_name_step(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
-    await state.update_data(name=esc_md(message.text.strip()[:60]))
+    await state.update_data(name=esc_md(_clean_log_str(message.text.strip(), 60)))
     await state.set_state(HubStates.new_proj_desc)
     await safe_answer(
         message,
@@ -3989,7 +4284,7 @@ async def new_proj_done(message: types.Message, state: FSMContext):
     data = await state.get_data()
     await state.clear()
     raw_d = message.text.strip()
-    desc = "" if raw_d in (".", "нет") else esc_md(raw_d[:200])
+    desc = "" if raw_d in (".", "нет") else esc_md(_clean_log_str(raw_d, 200))
 
     if is_user_admin(u):
         pid = f"p_{uuid.uuid4().hex[:6]}"
@@ -4010,6 +4305,18 @@ async def new_proj_done(message: types.Message, state: FSMContext):
             await _dispatch_grid_view(message, u, start_new_series=True)
             return
         await open_projects_menu(message, u)
+        return
+
+    my_pend = [
+        r for r in db.get("project_requests", {}).values()
+        if str(r.get("uid")) == u["id"] and r.get("status") == "pending"
+    ]
+    if my_pend:
+        await safe_answer(
+            message,
+            "⏳ *У вас уже есть одна заявка на рассмотрении у администратора.* Дождитесь решения.",
+            u=u
+        )
         return
 
     req_id = f"req_{uuid.uuid4().hex[:6]}"
@@ -4049,10 +4356,6 @@ async def new_proj_done(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "p_ren")
 async def ren_proj_start(callback: types.CallbackQuery, state: FSMContext):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     await state.set_state(HubStates.rename_proj)
     await safe_edit(
         callback.message,
@@ -4068,7 +4371,7 @@ async def ren_proj_done(message: types.Message, state: FSMContext):
     await state.clear()
     proj = get_active_project(u)
     if message.text:
-        proj["name"] = esc_md(message.text.strip()[:60])
+        proj["name"] = esc_md(_clean_log_str(message.text.strip(), 60))
         save_db()
     if _eval_telemetry_step(u):
         await _dispatch_grid_view(message, u, start_new_series=True)
@@ -4268,10 +4571,6 @@ async def dump_limit_set_cb(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "f_imp_url")
 async def import_url_start(callback: types.CallbackQuery, state: FSMContext):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     await state.set_state(HubStates.import_url)
     await safe_edit(
         callback.message,
@@ -4292,33 +4591,30 @@ async def import_url_done(message: types.Message, state: FSMContext):
         return
 
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            raw_bytes = await _fetch_url_bounded(session, url, max_bytes=MAX_WEB_IMPORT_BYTES)
-            raw_html = raw_bytes.decode("utf-8", errors="ignore")
-            title_m = re.search(r"<title[^>]*>(.*?)</title>", raw_html, re.IGNORECASE | re.DOTALL)
-            page_title = esc_md(html.unescape(title_m.group(1).strip())[:40]) if title_m else esc_md(url[:40])
-            cleaned = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw_html, flags=re.IGNORECASE | re.DOTALL)
-            cleaned = re.sub(r"<[^>]+>", "\n", cleaned)
-            cleaned = html.unescape(cleaned)
-            lines = [ln.strip() for ln in cleaned.splitlines() if len(ln.strip()) > 2]
-            extracted_text = f"Источник: {url}\n\n" + "\n\n".join(lines)
+        async with _get_upload_sem():
+            raw_bytes = await _fetch_url_bounded(url, max_bytes=MAX_WEB_IMPORT_BYTES)
+        raw_html = raw_bytes.decode("utf-8", errors="ignore")
+        title_m = re.search(r"<title[^>]*>(.*?)</title>", raw_html, re.IGNORECASE | re.DOTALL)
+        page_title = esc_md(_clean_log_str(html.unescape(title_m.group(1).strip())[:40] if title_m else url[:40], 40))
+        cleaned = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw_html, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r"<[^>]+>", "\n", cleaned)
+        cleaned = html.unescape(cleaned)
+        lines = [ln.strip() for ln in cleaned.splitlines() if len(ln.strip()) > 2]
+        extracted_text = f"Источник: {url}\n\n" + "\n\n".join(lines)
 
         trimmed_txt = extracted_text[:80000]
-        item_sz = len(trimmed_txt.encode("utf-8"))
+        item_sz = len(trimmed_txt.encode("utf-8")) + 512
         ok_st, err_st = check_storage_allowance(u, item_sz)
         if not ok_st:
             await safe_answer(message, err_st, u=u)
             return
 
-        pages = split_into_pages(trimmed_txt)
         proj["files"].append({
             "type": "note",
             "file_id": None,
             "name": f"🌐 {page_title}",
             "caption": url[:200],
             "extracted_text": trimmed_txt,
-            "pages": pages,
             "date": datetime.now().strftime("%d.%m %H:%M")
         })
         limit = max(3, min(10, u.get("dump_limit", 5)))
@@ -4340,17 +4636,22 @@ async def handle_any_document_dump(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     proj = get_active_project(u)
     doc = message.document
-    fname = esc_md(doc.file_name or f"Документ_{len(proj['files'])+1}")
+    fname = esc_md(_clean_log_str(doc.file_name or f"Документ_{len(proj['files'])+1}", 45))
 
     extracted_text = ""
-    if doc.file_size and doc.file_size < 19 * 1024 * 1024:
+    if doc.file_size and doc.file_size <= MAX_DOC_DOWNLOAD_BYTES:
         if fname.lower().endswith((".md", ".txt", ".json", ".py", ".csv", ".pdf", ".docx", ".pptx", ".html", ".lua", ".luau", ".js")):
             try:
-                tg_file = await bot.get_file(doc.file_id)
-                file_bytes = (await bot.download_file(tg_file.file_path)).read()
-                extracted_text = extract_text_from_bytes(file_bytes, fname)
+                async with _get_upload_sem():
+                    tg_file = await bot.get_file(doc.file_id)
+                    stream = await bot.download_file(tg_file.file_path)
+                    file_bytes = stream.read(MAX_DOC_DOWNLOAD_BYTES + 1)
+                    if len(file_bytes) <= MAX_DOC_DOWNLOAD_BYTES:
+                        extracted_text = await extract_text_isolated(file_bytes, fname, timeout_sec=8.0)
+                    else:
+                        extracted_text = "[Файл превышает лимит 10 МБ для текстового разбора]"
             except Exception as e:
-                extracted_text = f"[Не удалось разобрать текст: {e}]"
+                extracted_text = f"[Не удалось разобрать текст: {esc_md(e)}]"
 
     actual_db_bytes = len(extracted_text.encode("utf-8")) + len((message.caption or "").encode("utf-8")) + 1024
     ok_st, err_st = check_storage_allowance(u, actual_db_bytes)
@@ -4358,14 +4659,12 @@ async def handle_any_document_dump(message: types.Message, state: FSMContext):
         await safe_answer(message, err_st, u=u)
         return
 
-    pages = split_into_pages(extracted_text) if extracted_text else []
     proj["files"].append({
         "type": "doc",
         "file_id": doc.file_id,
         "name": fname,
         "caption": (message.caption or "")[:300],
         "extracted_text": extracted_text,
-        "pages": pages,
         "date": datetime.now().strftime("%d.%m %H:%M")
     })
     limit = max(3, min(10, u.get("dump_limit", 5)))
@@ -4387,12 +4686,13 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     proj = get_active_project(u)
     photo = message.photo[-1]
-    caption = esc_md((message.caption or f"Иллюстрация №{len(proj['files'])+1}")[:250])
+    caption = esc_md(_clean_log_str(message.caption or f"Иллюстрация №{len(proj['files'])+1}", 200))
 
     curr_state = await state.get_state()
     if curr_state == HubStates.ai_chat_mode.state:
-        tg_file = await bot.get_file(photo.file_id)
-        photo_bytes = (await bot.download_file(tg_file.file_path)).read()
+        async with _get_upload_sem():
+            tg_file = await bot.get_file(photo.file_id)
+            photo_bytes = (await bot.download_file(tg_file.file_path)).read(MAX_DOC_DOWNLOAD_BYTES)
         ans = await ask_gemini_with_rotation(u, proj, caption, photo_bytes=photo_bytes)
         if _eval_telemetry_step(u):
             await _dispatch_grid_view(message, u, start_new_series=True)
@@ -4412,7 +4712,6 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
         "name": caption[:35],
         "caption": caption,
         "extracted_text": f"[Иллюстрация: {caption}]",
-        "pages": [f"📸 Иллюстрация: {caption}"],
         "date": datetime.now().strftime("%d.%m %H:%M")
     })
     limit = max(3, min(10, u.get("dump_limit", 5)))
@@ -4429,16 +4728,14 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("fvision_"))
 async def analyze_saved_photo_cb(callback: types.CallbackQuery):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     proj = get_active_project(u)
     idx = int(callback.data.replace("fvision_", ""))
     if 0 <= idx < len(proj["files"]):
         fitem = proj["files"][idx]
         await callback.answer("Передаю снимок старшему консультанту...")
-        tg_file = await bot.get_file(fitem["file_id"])
-        photo_bytes = (await bot.download_file(tg_file.file_path)).read()
+        async with _get_upload_sem():
+            tg_file = await bot.get_file(fitem["file_id"])
+            photo_bytes = (await bot.download_file(tg_file.file_path)).read(MAX_DOC_DOWNLOAD_BYTES)
         prompt = fitem.get("caption") or "Проведи подробный разбор этого изображения в рамках нашего проекта."
         ans = await ask_gemini_with_rotation(u, proj, prompt, photo_bytes=photo_bytes)
         await send_long_text(callback.message, ans, u=u)
@@ -4535,10 +4832,6 @@ async def clear_project_dump_yes_cb(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "f_add_note")
 async def add_text_note_start(callback: types.CallbackQuery, state: FSMContext):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     await state.set_state(HubStates.add_text_note)
     await safe_edit(
         callback.message,
@@ -4561,14 +4854,13 @@ async def add_text_note_done(message: types.Message, state: FSMContext):
             await safe_answer(message, err_st, u=u)
             return
 
-        title = esc_md(txt.split("\n")[0][:32].strip("* ") or f"Записка №{len(proj['files'])+1}")
+        title = esc_md(_clean_log_str(txt.split("\n")[0][:32].strip("* ") or f"Записка №{len(proj['files'])+1}", 35))
         proj["files"].append({
             "type": "note",
             "file_id": None,
             "name": title,
             "caption": "",
             "extracted_text": txt,
-            "pages": split_into_pages(txt),
             "date": datetime.now().strftime("%d.%m %H:%M")
         })
         limit = max(3, min(10, u.get("dump_limit", 5)))
@@ -4592,15 +4884,14 @@ async def open_reader_menu(message: types.Message, u: dict, edit_existing: bool 
     f_idx = min(proj.get("active_file", 0), len(proj["files"]) - 1)
     proj["active_file"] = f_idx
     fitem = proj["files"][f_idx]
-    pages = fitem.get("pages") or split_into_pages(fitem.get("extracted_text", ""))
-    fitem["pages"] = pages
+    pages = split_into_pages(fitem.get("extracted_text", ""))
 
     p_idx = min(proj.get("curr_page", 0), len(pages) - 1)
     proj["curr_page"] = p_idx
-    page_text = pages[p_idx]
+    page_text = esc_md(pages[p_idx])
 
     text = (
-        f"📁 *{esc_md(proj['name'])}* $\\rightarrow$ 📄 *{esc_md(fitem['name'])}*\n"
+        f"📁 *{esc_md(proj['name'])}* → 📄 *{esc_md(fitem['name'])}*\n"
         f"📑 *Лист {p_idx+1} из {len(pages)}:*\n\n{page_text}"
     )
     kb = get_reader_kb(f_idx, p_idx, len(pages), len(proj["files"]))
@@ -4661,14 +4952,14 @@ async def reader_navigate_cb(callback: types.CallbackQuery):
     f_idx = proj.get("active_file", 0)
     if 0 <= f_idx < len(proj["files"]):
         fitem = proj["files"][f_idx]
-        pages = fitem.get("pages", [])
+        pages = split_into_pages(fitem.get("extracted_text", ""))
         if 0 <= p_idx < len(pages):
             proj["curr_page"] = p_idx
             save_db()
             await safe_edit(
                 callback.message,
-                f"📁 *{esc_md(proj['name'])}* $\\rightarrow$ 📄 *{esc_md(fitem['name'])}*\n"
-                f"📑 *Лист {p_idx+1} из {len(pages)}:*\n\n{pages[p_idx]}",
+                f"📁 *{esc_md(proj['name'])}* → 📄 *{esc_md(fitem['name'])}*\n"
+                f"📑 *Лист {p_idx+1} из {len(pages)}:*\n\n{esc_md(pages[p_idx])}",
                 reply_markup=get_reader_kb(f_idx, p_idx, len(pages), len(proj["files"]))
             )
     await callback.answer()
@@ -4676,10 +4967,6 @@ async def reader_navigate_cb(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("redit_"))
 async def reader_edit_page_start(callback: types.CallbackQuery, state: FSMContext):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     p_idx = int(callback.data.replace("redit_", ""))
     await state.update_data(p_idx=p_idx)
     await state.set_state(HubStates.edit_page_text)
@@ -4701,17 +4988,19 @@ async def reader_edit_page_done(message: types.Message, state: FSMContext):
     p_idx = data.get("p_idx", 0)
     if 0 <= f_idx < len(proj["files"]) and message.text:
         fitem = proj["files"][f_idx]
-        if 0 <= p_idx < len(fitem["pages"]):
+        pages = split_into_pages(fitem.get("extracted_text", ""))
+        if 0 <= p_idx < len(pages):
             new_page_txt = message.text.strip()[:25000]
-            old_page_txt = fitem["pages"][p_idx]
+            old_page_txt = pages[p_idx]
             delta_b = len(new_page_txt.encode("utf-8")) - len(old_page_txt.encode("utf-8"))
             if delta_b > 0:
                 ok_st, err_st = check_storage_allowance(u, delta_b)
                 if not ok_st:
                     await safe_answer(message, err_st, u=u)
                     return
-            fitem["pages"][p_idx] = new_page_txt
-            fitem["extracted_text"] = "\n\n".join(fitem["pages"])
+            pages[p_idx] = new_page_txt
+            fitem["extracted_text"] = "\n\n".join(pages)
+            fitem.pop("pages", None)
             save_db()
     if _eval_telemetry_step(u):
         await _dispatch_grid_view(message, u, start_new_series=True)
@@ -4776,10 +5065,6 @@ async def switch_code_tab_cb(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "c_new")
 async def new_code_start(callback: types.CallbackQuery, state: FSMContext):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     await state.set_state(HubStates.code_title)
     await safe_edit(
         callback.message,
@@ -4792,7 +5077,7 @@ async def new_code_start(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(HubStates.code_title)
 async def new_code_title_step(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
-    await state.update_data(title=esc_md(message.text.strip()[:50]))
+    await state.update_data(title=esc_md(_clean_log_str(message.text.strip(), 50)))
     await state.set_state(HubStates.code_desc)
     await safe_answer(
         message,
@@ -4806,7 +5091,7 @@ async def new_code_title_step(message: types.Message, state: FSMContext):
 async def new_code_desc_step(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     raw_d = message.text.strip()
-    desc = "" if raw_d == "." else esc_md(raw_d[:150])
+    desc = "" if raw_d == "." else esc_md(_clean_log_str(raw_d, 150))
     await state.update_data(desc=desc)
     await state.set_state(HubStates.code_body)
     await safe_answer(
@@ -4873,7 +5158,7 @@ async def view_my_code_cb(callback: types.CallbackQuery):
         f"📌 *{esc_md(c['title'])}*\n"
         f"Статус: _{status}_\n"
         f"Опись: _{esc_md(c.get('desc') or 'не указано')}_\n\n"
-        f"```text\n{c.get('code', '')}\n```"
+        f"```text\n{c.get('code', '').replace('`', '')}\n```"
     )
     await safe_edit(callback.message, text, reply_markup=kb)
     await callback.answer()
@@ -4888,7 +5173,7 @@ async def toggle_code_public_cb(callback: types.CallbackQuery):
         c["is_public"] = not c.get("is_public", False)
         db["public_codes"] = [x for x in db["public_codes"] if x.get("id") != c["id"]]
         if c["is_public"]:
-            db["public_codes"].append(dict(c))
+            db["public_codes"].append(copy.deepcopy(c))
             await callback.answer("🌐 Выставлено на общую витрину конторы!", show_alert=True)
         else:
             await callback.answer("🔒 Спрятано обратно в личный сейф.", show_alert=True)
@@ -4899,10 +5184,6 @@ async def toggle_code_public_cb(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("ced_"))
 async def edit_my_code_start(callback: types.CallbackQuery, state: FSMContext):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     _, idx_str, field = callback.data.split("_")
     await state.update_data(c_idx=int(idx_str), c_field=field)
     await state.set_state(HubStates.code_edit_val)
@@ -4924,7 +5205,7 @@ async def edit_my_code_done(message: types.Message, state: FSMContext):
     field = data.get("c_field", "code")
     if 0 <= idx < len(u["my_codes"]) and message.text:
         c = u["my_codes"][idx]
-        new_val = message.text.strip()[:30000] if field == "code" else esc_md(message.text.strip()[:120])
+        new_val = message.text.strip()[:30000] if field == "code" else esc_md(_clean_log_str(message.text.strip(), 120))
         old_val = c.get(field, "")
         delta_b = len(new_val.encode("utf-8")) - len(old_val.encode("utf-8"))
         if delta_b > 0:
@@ -4987,7 +5268,7 @@ async def view_public_code_cb(callback: types.CallbackQuery):
         f"🌐 *{esc_md(c['title'])}*\n"
         f"Опубликовал: `@{esc_md(c.get('author_name', 'партнёр'))}`\n"
         f"Опись: _{esc_md(c.get('desc') or 'не указано')}_\n\n"
-        f"```text\n{c.get('code', '')}\n```"
+        f"```text\n{c.get('code', '').replace('`', '')}\n```"
     )
     await safe_edit(callback.message, text, reply_markup=kb)
     await callback.answer()
@@ -5062,9 +5343,6 @@ async def open_ai_chat_mode(message: types.Message, u: dict, state: FSMContext, 
 @dp.callback_query(F.data.startswith("fai_"))
 async def ask_ai_about_file_cb(callback: types.CallbackQuery, state: FSMContext):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     await callback.answer()
     await open_ai_chat_mode(callback.message, u, state, edit_existing=True)
 
@@ -5118,7 +5396,7 @@ async def save_last_ai_to_dump_cb(callback: types.CallbackQuery):
     proj = get_active_project(u)
     if proj.get("ai_history"):
         last_ans = proj["ai_history"][-1]["text"]
-        ans_bytes = len(last_ans.encode("utf-8"))
+        ans_bytes = len(last_ans.encode("utf-8")) + 512
         ok_st, _ = check_storage_allowance(u, ans_bytes)
         if not ok_st:
             await callback.answer("⚠️ Превышен лимит памяти аккаунта!", show_alert=True)
@@ -5131,7 +5409,6 @@ async def save_last_ai_to_dump_cb(callback: types.CallbackQuery):
             "name": title,
             "caption": "",
             "extracted_text": last_ans,
-            "pages": split_into_pages(last_ans),
             "date": datetime.now().strftime("%d.%m %H:%M")
         })
         limit = max(3, min(10, u.get("dump_limit", 5)))
@@ -5147,7 +5424,7 @@ async def open_keys_menu(message: types.Message, u: dict, edit_existing: bool = 
 
     buttons = []
     for idx, kobj in enumerate(p_keys):
-        raw_k = decrypt_api_key(kobj["key"])
+        raw_k = decrypt_api_key(kobj["key"], uid=u["id"])
         masked = f"{raw_k[:6]}..{raw_k[-4:]}" if len(raw_k) > 12 else "***"
         kname = kobj.get("name", f"Ключ №{idx+1}")
         buttons.append([
@@ -5162,7 +5439,7 @@ async def open_keys_menu(message: types.Message, u: dict, edit_existing: bool = 
 
     text = (
         f"🔑 *СЕЙФ ВАШИХ ЛИЧНЫХ КЛЮЧЕЙ API*\n\n"
-        f"• *Ключей на балансе:* *{len(p_keys)} шт.* _(хранятся в зашифрованном виде)_\n\n"
+        f"• *Ключей на балансе:* *{len(p_keys)} шт.* _(защищены персональным шифрованием)_\n\n"
         f"💡 _Все ключи записаны строго на ваше удостоверение. Жмите `✏️ Имя`, шоб присвоить ключу удобную вывеску, или на сам ключ для осмотра карточки:_"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -5182,7 +5459,7 @@ async def view_key_card_cb(callback: types.CallbackQuery):
         return
 
     kobj = p_keys[idx]
-    raw_k = decrypt_api_key(kobj["key"])
+    raw_k = decrypt_api_key(kobj["key"], uid=u["id"])
     masked = f"{raw_k[:8]}...{raw_k[-4:]}" if len(raw_k) > 14 else "***"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -5210,10 +5487,6 @@ async def key_back_cb(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "kadd_p")
 async def add_key_start(callback: types.CallbackQuery, state: FSMContext):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     await state.set_state(HubStates.add_api_key_name)
     await safe_edit(
         callback.message,
@@ -5226,7 +5499,7 @@ async def add_key_start(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(HubStates.add_api_key_name)
 async def add_key_name_step(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
-    custom_name = "" if message.text.strip() == "." else esc_md(message.text.strip()[:40])
+    custom_name = "" if message.text.strip() == "." else esc_md(_clean_log_str(message.text.strip(), 40))
     await state.update_data(kname=custom_name)
     await state.set_state(HubStates.add_api_key_val)
     await safe_answer(
@@ -5254,7 +5527,7 @@ async def add_key_done(message: types.Message, state: FSMContext):
         return
 
     target_list = u.setdefault("personal_keys", [])
-    existing_plain = {decrypt_api_key(x["key"]) for x in target_list}
+    existing_plain = {decrypt_api_key(x["key"], uid=u["id"]) for x in target_list}
     for idx, k_str in enumerate(raw_lines[:20], 1):
         if k_str not in existing_plain:
             num = len(target_list) + 1
@@ -5265,7 +5538,7 @@ async def add_key_done(message: types.Message, state: FSMContext):
             target_list.append({
                 "id": f"k_{uuid.uuid4().hex[:6]}",
                 "name": final_name,
-                "key": encrypt_api_key(k_str)
+                "key": encrypt_api_key(k_str, uid=u["id"])
             })
     save_db()
     if _eval_telemetry_step(u):
@@ -5277,9 +5550,6 @@ async def add_key_done(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("kren_"))
 async def rename_key_start(callback: types.CallbackQuery, state: FSMContext):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     idx = int(callback.data.replace("kren_", ""))
     p_keys = u.get("personal_keys", [])
     if 0 <= idx < len(p_keys):
@@ -5302,7 +5572,7 @@ async def rename_key_done(message: types.Message, state: FSMContext):
     idx = data.get("k_idx", 0)
     p_keys = u.get("personal_keys", [])
     if 0 <= idx < len(p_keys) and message.text:
-        p_keys[idx]["name"] = esc_md(message.text.strip()[:40])
+        p_keys[idx]["name"] = esc_md(_clean_log_str(message.text.strip(), 40))
         save_db()
     if _eval_telemetry_step(u):
         await _dispatch_grid_view(message, u, start_new_series=True)
@@ -5388,7 +5658,7 @@ async def search_query_done(message: types.Message, state: FSMContext):
             if q in fitem["name"].lower() or q in txt.lower():
                 pos = txt.lower().find(q)
                 snippet = txt[max(0, pos - 60):pos + 140].replace("\n", " ") if pos != -1 else fitem.get("caption", "")
-                found.append(f"📁 *{esc_md(p['name'])}* $\\rightarrow$ 📄 *{esc_md(fitem['name'])}*:\n`...{esc_md(snippet)}...`")
+                found.append(f"📁 *{esc_md(p['name'])}* → 📄 *{esc_md(fitem['name'])}*:\n`...{esc_md(snippet)}...`")
 
     for c in u["my_codes"] + db["public_codes"]:
         if q in c["title"].lower() or q in c.get("code", "").lower() or q in c.get("desc", "").lower():
@@ -5455,9 +5725,6 @@ async def open_settings_menu(message: types.Message, u: dict, edit_existing: boo
 @dp.callback_query(F.data == "open_settings_cb", StateFilter("*"))
 async def open_settings_cb_handler(callback: types.CallbackQuery, state: FSMContext):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     await state.clear()
     await open_settings_menu(callback.message, u, edit_existing=True)
     await callback.answer()
@@ -5513,9 +5780,6 @@ async def open_usage_menu(message: types.Message, u: dict, edit_existing: bool =
 @dp.callback_query(F.data == "open_usage_cb", StateFilter("*"))
 async def open_usage_cb_handler(callback: types.CallbackQuery, state: FSMContext):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     await state.clear()
     await open_usage_menu(callback.message, u, edit_existing=True)
     await callback.answer()
@@ -5530,10 +5794,6 @@ async def ui_soft_reset_cb(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "ui_hard_clear_ask", StateFilter("*"))
 async def ui_hard_clear_ask_cb(callback: types.CallbackQuery):
-    u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🧨 Таки да, стереть всё в ноль", callback_data="ui_hard_clear_yes"),
@@ -5562,9 +5822,6 @@ async def ui_hard_clear_yes_cb(callback: types.CallbackQuery, state: FSMContext)
 @dp.callback_query(F.data.startswith("grp_set_"), StateFilter("*"))
 async def switch_group_cb(callback: types.CallbackQuery, state: FSMContext):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     target_grp = callback.data.replace("grp_set_", "")
     if target_grp == "forest" and not _has_aux_access(u):
         await callback.answer("Эта папка ещё не открыта!", show_alert=True)
@@ -5581,9 +5838,6 @@ async def switch_group_cb(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("uied_"))
 async def edit_ui_start(callback: types.CallbackQuery, state: FSMContext):
     u = get_user(callback.from_user)
-    if _is_user_locked(u) > 0 or u.get("m_active"):
-        await callback.answer()
-        return
     ui_key = callback.data.replace("uied_", "")
     if ui_key in UI_LABELS:
         await state.update_data(ui_key=ui_key)
@@ -5603,7 +5857,7 @@ async def edit_ui_done(message: types.Message, state: FSMContext):
     await state.clear()
     ui_key = data.get("ui_key")
     if ui_key and message.text:
-        u["ui"][ui_key] = esc_md(message.text.strip()[:120])
+        u["ui"][ui_key] = esc_md(_clean_log_str(message.text.strip(), 120))
         save_db()
     if _eval_telemetry_step(u):
         await _dispatch_grid_view(message, u, start_new_series=True)
@@ -5639,32 +5893,62 @@ async def fallback_message_handler(message: types.Message):
 
 def _run_cli_admin_tool():
     global db
-    db = load_db()
     args = sys.argv[1:]
     if len(args) == 1 and args[0].lower() in ("admin", "--admin"):
+        db = load_db()
         print(_build_console_admin_table(db), flush=True)
         return
     raw_cmd = " ".join(args)
     if not raw_cmd.lower().startswith("admin"):
         raw_cmd = "admin " + raw_cmd
     if raw_cmd.strip().lower() == "admin list":
+        db = load_db()
         print(_build_console_admin_table(db), flush=True)
         return
-    res = asyncio.run(_exec_console_admin_cmd(raw_cmd))
-    save_db(sync_force=True)
+
+    try:
+        if os.path.exists(ADMIN_ACK_FILE):
+            os.remove(ADMIN_ACK_FILE)
+    except Exception:
+        pass
+
     with open(ADMIN_CMD_FILE, "a", encoding="utf-8") as cf:
         cf.write(raw_cmd + "\n")
+
+    for _ in range(25):
+        time.sleep(0.15)
+        if os.path.exists(ADMIN_ACK_FILE):
+            try:
+                with open(ADMIN_ACK_FILE, "r", encoding="utf-8") as af:
+                    ack_txt = af.read().strip()
+                os.remove(ADMIN_ACK_FILE)
+                if ack_txt:
+                    print(ack_txt, flush=True)
+                    return
+            except Exception:
+                break
+
+    if os.path.exists(ADMIN_CMD_FILE):
+        try:
+            os.remove(ADMIN_CMD_FILE)
+        except Exception:
+            pass
+    db = load_db()
+    res = asyncio.run(_exec_console_admin_cmd(raw_cmd))
+    save_db(sync_force=True)
     print(res, flush=True)
 
 
 async def main():
     global bot, BOT_USERNAME
+    _install_cli_wrapper()
     token = get_host_token()
     session_client = AiohttpSession(timeout=20)
     session_client._connector_init["family"] = socket.AF_INET
 
     bot = Bot(token=token, session=session_client)
     rem_task = asyncio.create_task(_reminders_daemon())
+    ipc_task = asyncio.create_task(_ipc_admin_watcher())
     stdin_task = asyncio.create_task(_stdin_console_listener())
     try:
         me = await bot.get_me()
@@ -5674,6 +5958,7 @@ async def main():
         await dp.start_polling(bot)
     finally:
         rem_task.cancel()
+        ipc_task.cancel()
         stdin_task.cancel()
         save_db(sync_force=True)
         await bot.session.close()
