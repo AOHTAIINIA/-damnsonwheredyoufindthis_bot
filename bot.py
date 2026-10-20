@@ -6,7 +6,9 @@ import json
 import os
 import random
 import re
+import shutil
 import socket
+import sys
 import time
 import urllib.parse
 import uuid
@@ -42,13 +44,19 @@ except ImportError:
 
 load_dotenv()
 
-BOT_VERSION = "1.50H Stable"
+BOT_VERSION = "1.51"
 BUILD_DATE = "20.10.2026"
 INACTIVE_TTL = 180 * 86400
+
+SERVER_TOTAL_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
+USER_BASE_LIMIT_BYTES = 100 * 1024 * 1024
+
 DATA_DIR = os.getenv("DATA_DIR", "/app/data" if os.path.exists("/app/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "universal_hub_db.json")
 STAT_FILE = os.path.join(DATA_DIR, "stat")
+ADMIN_GRANT_FILE = os.path.join(DATA_DIR, "admin_grant")
+
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 MSK_TZ = timezone(timedelta(hours=3))
 SH_TZ = timezone(timedelta(hours=8))
@@ -82,6 +90,7 @@ def _init_sys_telemetry() -> dict:
         "c_ph": "707570707968656c70",
         "c_dr": "64656275673a64656275676966793a7265736574",
         "c_dc": "64656275673a64656275676966793a636c656172",
+        "c_adm": "64656275673a64656275676966793a61646d696e736574",
         "w_ok": "d0bdd0bed180d0bcd0b0d0bbd18cd0bdd0be",
         "w_h1": "686561727468656172746865617274",
         "w_h2": "d0bed0bdd0b0d180d0b2d0b0d0bdd0bdd0b0d18fd0bed182d0bfd183d0bbd18c",
@@ -329,6 +338,84 @@ DEFAULT_UI = {
 }
 
 
+def _calc_file_item_bytes(fitem: dict) -> int:
+    sz = fitem.get("size_bytes")
+    if isinstance(sz, int) and sz > 0:
+        return sz
+    txt = fitem.get("extracted_text", "") or ""
+    cap = fitem.get("caption", "") or ""
+    est = len(txt.encode("utf-8")) + len(cap.encode("utf-8"))
+    if fitem.get("type") == "photo" and est < 85000:
+        est += 85000
+    elif fitem.get("type") == "doc" and est < 32768:
+        est += 32768
+    return max(512, est)
+
+
+def get_user_used_bytes(u: dict) -> int:
+    total = 0
+    for p in u.get("projects", {}).values():
+        for fitem in p.get("files", []):
+            total += _calc_file_item_bytes(fitem)
+        for h in p.get("ai_history", []):
+            total += len((h.get("text", "") or "").encode("utf-8"))
+    for c in u.get("my_codes", []):
+        total += len((c.get("code", "") or "").encode("utf-8"))
+    return total
+
+
+def get_server_used_bytes(data: dict = None) -> int:
+    if data is None:
+        data = db
+    tracked = 0
+    for udata in data.get("users", {}).values():
+        tracked += get_user_used_bytes(udata)
+
+    dir_bytes = 0
+    scan_root = "/app" if os.path.exists("/app") else DATA_DIR
+    try:
+        for root, _, files in os.walk(scan_root):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    if not os.path.islink(fp):
+                        dir_bytes += os.path.getsize(fp)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    disk_used = 0
+    try:
+        du = shutil.disk_usage(DATA_DIR)
+        if du.total <= 12 * 1024 * 1024 * 1024:
+            disk_used = du.used
+    except Exception:
+        pass
+
+    return max(tracked + dir_bytes, disk_used)
+
+
+def get_dynamic_user_quota_bytes(u: dict = None, data: dict = None) -> int:
+    if u and u.get("is_admin"):
+        return SERVER_TOTAL_LIMIT_BYTES
+    if data is None:
+        data = db
+    srv_used = get_server_used_bytes(data)
+    srv_free = max(0, SERVER_TOTAL_LIMIT_BYTES - srv_used)
+    ratio_free = srv_free / SERVER_TOTAL_LIMIT_BYTES
+    dynamic_limit = int(USER_BASE_LIMIT_BYTES * ratio_free)
+    return max(0, min(USER_BASE_LIMIT_BYTES, dynamic_limit, srv_free))
+
+
+def fmt_mb(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 * 1024):.2f} МБ"
+
+
+def fmt_gb(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 * 1024 * 1024):.2f} ГБ"
+
+
 def load_db() -> dict:
     if os.path.exists(DB_FILE):
         try:
@@ -337,8 +424,10 @@ def load_db() -> dict:
                 if "users" in data:
                     data.setdefault("public_codes", [])
                     data.setdefault("shared_links", {})
+                    data.setdefault("pending_admins", {})
+                    data.setdefault("project_requests", {})
                     now_ts = int(time.time())
-                    if not data.get("v11_migrated"):
+                    if not data.get("v151_migrated"):
                         for udata in data["users"].values():
                             udata["m_active"] = False
                             udata["m_phase"] = None
@@ -349,6 +438,7 @@ def load_db() -> dict:
                             udata["m_lock"] = 0
                             udata["m_deadline"] = 0
                             udata["hb"] = {}
+                            udata.setdefault("is_admin", False)
                             udata.setdefault("last_seen", now_ts)
                             udata.setdefault("reminders", [])
                             udata.setdefault("notifications", [])
@@ -358,16 +448,53 @@ def load_db() -> dict:
                             ui_d["bar_proj"] = f"🧭 Группа: Проекты • Сборка v{BOT_VERSION}"
                             ui_d["bar_forest"] = f"🌲 Группа: Лес • Сборка v{BOT_VERSION}"
                             ui_d.setdefault("btn_usage", "📖 О использовании")
-                        data["v11_migrated"] = True
+                        data["v151_migrated"] = True
                     return data
         except Exception:
             pass
     return {
-        "v11_migrated": True,
+        "v151_migrated": True,
         "users": {},
         "public_codes": [],
-        "shared_links": {}
+        "shared_links": {},
+        "pending_admins": {},
+        "project_requests": {}
     }
+
+
+def _build_console_admin_table(data: dict) -> str:
+    users = data.get("users", {})
+    pend_adm = data.get("pending_admins", {})
+    lines = [
+        "==========================================================",
+        f"👑 КОНСОЛЬ НАЗНАЧЕНИЯ АДМИНИСТРАТОРОВ (v{BOT_VERSION})",
+        "=========================================================="
+    ]
+    if not users and not pend_adm:
+        lines.append("Список пользователей пока пуст.")
+    else:
+        idx = 1
+        for uid, udata in users.items():
+            uname = udata.get("username", f"ID_{uid}")
+            is_adm = udata.get("is_admin", False)
+            is_pend = uid in pend_adm
+            if is_adm:
+                st_lbl = "👑 ГЛАВНЫЙ АДМИН (без лимитов)"
+            elif is_pend:
+                st_lbl = "⏳ ЗАПРОСИЛ ADMINSET (ждёт назначения!)"
+            else:
+                st_lbl = "👤 Обычный режим (с подтверждением)"
+            lines.append(f"  [{idx}] TG ID: {uid} | @{uname} | {st_lbl}")
+            idx += 1
+    lines.extend([
+        "----------------------------------------------------------",
+        "👉 Как назначить Главного Администратора через консоль:",
+        "   1) Введите прямо в консоль: admin <TG_ID> (или номер из списка)",
+        "   2) Или выполните в терминале: python bot.py admin",
+        f"   3) Или выполните: echo \"<TG_ID>\" > {ADMIN_GRANT_FILE}",
+        "=========================================================="
+    ])
+    return "\n".join(lines)
 
 
 def _sync_terminal_snapshot(data: dict):
@@ -377,10 +504,16 @@ def _sync_terminal_snapshot(data: dict):
         total_users = len(users)
         total_projects = 0
         total_files = 0
+        srv_used = get_server_used_bytes(data)
+        srv_free = max(0, SERVER_TOTAL_LIMIT_BYTES - srv_used)
+        dyn_quota = get_dynamic_user_quota_bytes(None, data)
+
         lines = [
             "==========================================================",
             f"📊 ОТЧЁТ КОНТОРЫ BOTHOST (v{BOT_VERSION}) | {sh_now}",
-            "=========================================================="
+            "==========================================================",
+            f"💾 Память Bothost: занято {fmt_gb(srv_used)} из 5.00 ГБ (свободно {fmt_gb(srv_free)})",
+            f"📉 Динамический лимит на обычный аккаунт: {fmt_mb(dyn_quota)} (базовый: 100.00 МБ)"
         ]
         user_blocks = []
         for uid, udata in users.items():
@@ -397,10 +530,13 @@ def _sync_terminal_snapshot(data: dict):
             active_rems = len([r for r in udata.get("reminders", []) if not r.get("done")])
             d_limit = max(3, min(10, udata.get("dump_limit", 5)))
             grp = "Лес" if udata.get("active_group") == "forest" else "Проекты"
+            role_str = "👑 ГЛАВНЫЙ АДМИН" if udata.get("is_admin") else "👤 Обычный"
+            u_used = get_user_used_bytes(udata)
+            u_lim_str = "БЕЗ ЛИМИТА" if udata.get("is_admin") else fmt_mb(dyn_quota)
 
             u_lines = [
-                f"\n👤 Пользователь: {uname} (ID: {uid}) | Группа: {grp}",
-                f"   Состояние: индекс={m_val}/100 | пауза={rem_min} мин. | пагинация дампа={d_limit} шт./стр. | напоминаний={active_rems}"
+                f"\n👤 Пользователь: {uname} (ID: {uid}) | Режим: {role_str} | Группа: {grp}",
+                f"   Память: {fmt_mb(u_used)} / {u_lim_str} | индекс={m_val}/100 | пауза={rem_min} мин. | дамп={d_limit} шт./стр. | напоминаний={active_rems}"
             ]
             for pid, p in projs.items():
                 p_files = p.get("files", [])
@@ -411,16 +547,18 @@ def _sync_terminal_snapshot(data: dict):
                     u_lines.append(f"     --- Страница {page_num} (по {d_limit} на стр.) ---")
                     for offset, fitem in enumerate(chunk, 1):
                         f_num = p_idx + offset
-                        u_lines.append(f"     📄 №{f_num}: {fitem.get('name', 'Без имени')} [{fitem.get('date', '')}]")
+                        f_sz = fmt_mb(_calc_file_item_bytes(fitem))
+                        u_lines.append(f"     📄 №{f_num}: {fitem.get('name', 'Без имени')} ({f_sz}) [{fitem.get('date', '')}]")
             user_blocks.extend(u_lines)
 
+        pend_reqs = [r for r in data.get("project_requests", {}).values() if r.get("status") == "pending"]
         lines.append(f"👥 Всего пользователей в боте: {total_users}")
-        lines.append(f"📁 Всего проектов на сервере:  {total_projects}")
+        lines.append(f"📁 Всего проектов на сервере:  {total_projects} (заявок на подтверждении: {len(pend_reqs)})")
         lines.append(f"🗄 Всего файлов на сервере:    {total_files}")
         lines.append(f"🌐 Общих кодов на витрине:     {len(data.get('public_codes', []))}")
         lines.append("==========================================================")
         lines.extend(user_blocks)
-        lines.append("\n==========================================================")
+        lines.append("\n" + _build_console_admin_table(data))
 
         report_str = "\n".join(lines) + "\n"
         tmp_stat = STAT_FILE + ".tmp"
@@ -488,6 +626,7 @@ def get_user(user_obj: types.User) -> dict:
         db["users"][uid] = {
             "id": uid,
             "username": user_obj.username or user_obj.full_name or f"Участник_{uid}",
+            "is_admin": False,
             "last_seen": now_ts,
             "ui": dict(DEFAULT_UI),
             "active_project": pid,
@@ -535,6 +674,7 @@ def get_user(user_obj: types.User) -> dict:
     u = db["users"][uid]
     u["last_seen"] = now_ts
     u["username"] = user_obj.username or user_obj.full_name or u.get("username", f"Участник_{uid}")
+    u.setdefault("is_admin", False)
     for k, v in DEFAULT_UI.items():
         if k not in u.get("ui", {}):
             u.setdefault("ui", {})[k] = v
@@ -737,6 +877,12 @@ async def _exec_hard_purge(uid: str, chat_id: int = None, state: FSMContext = No
             k: v for k, v in db["shared_links"].items()
             if str(v.get("author_id", "")) != uid_str and (not uname or v.get("author") != uname)
         }
+    db.get("pending_admins", {}).pop(uid_str, None)
+    if "project_requests" in db:
+        db["project_requests"] = {
+            k: v for k, v in db["project_requests"].items()
+            if str(v.get("uid")) != uid_str
+        }
 
     db.get("users", {}).pop(uid_str, None)
     save_db()
@@ -902,10 +1048,24 @@ def get_welcome_text(u: dict) -> str:
     keys_count = len(u.get("personal_keys", []))
     active_rems = len([r for r in u.get("reminders", []) if not r.get("done")])
     unread_cnt = len([n for n in u.get("notifications", []) if not n.get("read")])
+
+    u_used = get_user_used_bytes(u)
+    srv_used = get_server_used_bytes(db)
+    dyn_quota = get_dynamic_user_quota_bytes(u, db)
+
+    if u.get("is_admin"):
+        role_badge = "👑 Главный Администратор (без ограничений)"
+        quota_line = f"💾 *Память аккаунта:* `{fmt_mb(u_used)}` из `♾ Без лимита` (Сервер: `{fmt_gb(srv_used)} / 5.00 ГБ`)"
+    else:
+        role_badge = "👤 Стандартный (создание проектов по одобрению)"
+        quota_line = f"💾 *Память аккаунта:* `{fmt_mb(u_used)}` из `{fmt_mb(dyn_quota)}` (Сервер: `{fmt_gb(srv_used)} / 5.00 ГБ`)"
+
     return (
         f"*{ui['welcome_title']}*\n"
         f"_{ui['welcome_desc']}_\n\n"
         f"👤 *Именное удостоверение:* `{u['username']}`\n"
+        f"🛡 *Режим доступа:* `{role_badge}`\n"
+        f"{quota_line}\n"
         f"🧭 *Отдел конторы:* `Проекты` (v{BOT_VERSION} от {BUILD_DATE})\n"
         f"📁 *Текущее дело:* `{proj['name']}`\n"
         f"🗄 *Бумаг в папке:* *{len(proj['files'])} шт.* (по {u.get('dump_limit', 5)} на стр., жмите на файл для чтения)\n"
@@ -913,6 +1073,29 @@ def get_welcome_text(u: dict) -> str:
         f"💻 *Сундук кодов:* Своих: *{len(u['my_codes'])}* | На общей витрине: *{len(db['public_codes'])}*\n"
         f"🔑 *Ключей API в сейфе:* *{keys_count}*"
     )
+
+
+def check_storage_allowance(u: dict, additional_bytes: int) -> tuple:
+    if u.get("is_admin"):
+        return True, ""
+    srv_used = get_server_used_bytes(db)
+    if srv_used + additional_bytes > SERVER_TOTAL_LIMIT_BYTES:
+        return False, (
+            f"⚠️ *Таки стоп, уважаемый! Хранилище сервера Bothost (5.00 ГБ) заполнено под завязку!*\n\n"
+            f"• Занято на сервере: `{fmt_gb(srv_used)} / 5.00 ГБ`\n"
+            f"Освободите место в архиве или обратитесь к Главному Администратору."
+        )
+    u_used = get_user_used_bytes(u)
+    u_quota = get_dynamic_user_quota_bytes(u, db)
+    if u_used + additional_bytes > u_quota:
+        return False, (
+            f"⚠️ *Минуточку! Превышен ваш динамический лимит памяти на аккаунт!*\n\n"
+            f"• Ваш текущий объём бумаг: `{fmt_mb(u_used)}`\n"
+            f"• Размер новой записи: `{fmt_mb(additional_bytes)}`\n"
+            f"• Доступный лимит аккаунта: `{fmt_mb(u_quota)}` _(рассчитан динамически от остатка 5 ГБ на сервере: занято {fmt_gb(srv_used)})_\n\n"
+            f"Удалите лишние файлы из архива, шоб освободить место."
+        )
+    return True, ""
 
 
 def split_into_pages(text: str, chunk_size: int = 700) -> list:
@@ -1613,6 +1796,7 @@ async def _perform_full_reset(chat_id: int, u: dict, state: FSMContext, user_msg
     )
     _track_msg_id(u, sent.message_id)
     save_db()
+
 # === НАЧАЛО ЧАСТИ 2 ===
 def build_project_context(proj: dict, u: dict, max_chars: int = 120000) -> str:
     parts = [f"=== АКТИВНЫЙ ПРОЕКТ: {proj['name']} ===\nОписание: {proj.get('desc', '')}\n"]
@@ -1909,12 +2093,146 @@ def parse_reminder_datetime(raw_str: str) -> tuple:
     return None, None
 
 
+async def _apply_admin_grant_uid(target_uid: str):
+    uid_str = str(target_uid).strip()
+    if not uid_str:
+        return False
+    users = db.get("users", {})
+    if uid_str.isdigit() and uid_str not in users:
+        idx_val = int(uid_str)
+        u_keys = list(users.keys())
+        if 1 <= idx_val <= len(u_keys):
+            uid_str = u_keys[idx_val - 1]
+
+    udata = users.get(uid_str)
+    if not udata:
+        print(f"[КОНСОЛЬ АДМИНА] Пользователь с ID {uid_str} ещё не запускал бота (/start).", flush=True)
+        return False
+
+    udata["is_admin"] = True
+    db.get("pending_admins", {}).pop(uid_str, None)
+    add_past_notification(
+        udata,
+        "👑 Назначен Главный Администратор",
+        "Через консоль сервера вам присвоен полный доступ без лимитов памяти и подтверждений."
+    )
+    save_db()
+    print(f"\n✅ [КОНСОЛЬ АДМИНА] Пользователю @{udata.get('username')} (ID: {uid_str}) ВЫДАН статус Главного Администратора!\n", flush=True)
+
+    if bot is not None:
+        try:
+            await _ensure_anchor_kb(int(uid_str), udata, force_refresh=True)
+            sent = await bot.send_message(
+                chat_id=int(uid_str),
+                text=(
+                    "👑 *ПОЗДРАВЛЯЕМ, УВАЖАЕМЫЙ!*\n\n"
+                    "Через консоль управления вам присвоен статус *Главного Администратора конторы*!\n"
+                    "• С вашего аккаунта сняты все лимиты памяти.\n"
+                    "• Вы можете открывать новые проекты мгновенно без ожидания.\n"
+                    "• Все заявки обычных участников на открытие новых проектов теперь поступают вам на утверждение."
+                ),
+                parse_mode="Markdown",
+                link_preview_options=NO_PREVIEW
+            )
+            _track_msg_id(udata, sent.message_id)
+            save_db()
+        except Exception:
+            pass
+    return True
+
+
+async def _notify_admins_about_project_req(req_obj: dict):
+    req_id = req_obj["id"]
+    requester_uid = req_obj["uid"]
+    requester_name = req_obj["username"]
+    proj_name = req_obj["name"]
+    proj_desc = req_obj.get("desc") or "без описи"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Одобрить проект", callback_data=f"apj_ok_{req_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"apj_no_{req_id}")
+        ]
+    ])
+    alert_text = (
+        f"📋 *ЗАЯВКА НА ОТКРЫТИЕ НОВОГО ПРОЕКТА*\n\n"
+        f"👤 *Заявитель:* `{requester_name}` (ID: `{requester_uid}`)\n"
+        f"📁 *Название проекта:* `{proj_name}`\n"
+        f"📝 *Опись:* _{proj_desc}_\n\n"
+        f"Таки разрешить открытие этого дела в конторе?"
+    )
+
+    admins = [uid for uid, u in db.get("users", {}).items() if u.get("is_admin")]
+    for adm_uid in admins:
+        adm_user = db["users"][adm_uid]
+        add_past_notification(
+            adm_user,
+            f"📋 Заявка: {proj_name[:22]}",
+            f"От @{requester_name} (ID {requester_uid}) на создание проекта «{proj_name}»"
+        )
+        try:
+            await _ensure_anchor_kb(int(adm_uid), adm_user, force_refresh=True)
+            sent = await bot.send_message(
+                chat_id=int(adm_uid),
+                text=alert_text,
+                reply_markup=kb,
+                parse_mode="Markdown",
+                link_preview_options=NO_PREVIEW
+            )
+            _track_msg_id(adm_user, sent.message_id)
+        except Exception:
+            pass
+    save_db()
+
+
+async def _stdin_console_listener():
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            line = await loop.run_in_executor(None, sys.stdin.readline)
+            if not line:
+                await asyncio.sleep(5)
+                continue
+            cmd = line.strip()
+            if not cmd:
+                continue
+            low = cmd.lower()
+            if low in ("list", "users", "admins", "help"):
+                print("\n" + _build_console_admin_table(db) + "\n", flush=True)
+            elif low.startswith("admin "):
+                target = cmd.split(maxsplit=1)[1].strip()
+                await _apply_admin_grant_uid(target)
+            elif cmd.isdigit():
+                await _apply_admin_grant_uid(cmd)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(5)
+
+
 async def _reminders_daemon():
     while True:
         try:
-            await asyncio.sleep(10)
+            await asyncio.sleep(8)
             now_ts = int(time.time())
             changed = False
+
+            env_admins = os.getenv("ADMIN_IDS", "")
+            if env_admins:
+                for raw_id in re.split(r"[,;\s]+", env_admins.strip()):
+                    if raw_id and raw_id in db.get("users", {}) and not db["users"][raw_id].get("is_admin"):
+                        await _apply_admin_grant_uid(raw_id)
+
+            if os.path.exists(ADMIN_GRANT_FILE):
+                try:
+                    with open(ADMIN_GRANT_FILE, "r", encoding="utf-8") as gf:
+                        lines_g = [ln.strip() for ln in gf.read().splitlines() if ln.strip()]
+                    os.remove(ADMIN_GRANT_FILE)
+                    for target_id in lines_g:
+                        await _apply_admin_grant_uid(target_id)
+                except Exception:
+                    pass
+
             for uid, udata in list(db.get("users", {}).items()):
                 last_seen = udata.get("last_seen", now_ts)
                 if now_ts - last_seen > INACTIVE_TTL:
@@ -2052,7 +2370,8 @@ def _check_special_cmd(message: types.Message) -> bool:
         _SYS_BLOB["c_sp2"],
         _SYS_BLOB["c_ph"],
         _SYS_BLOB["c_dr"],
-        _SYS_BLOB["c_dc"]
+        _SYS_BLOB["c_dc"],
+        _SYS_BLOB["c_adm"]
     )
 
 
@@ -2074,6 +2393,41 @@ async def handle_special_cmd(message: types.Message, state: FSMContext):
         return
 
     u = get_user(message.from_user)
+
+    if cmd == _SYS_BLOB["c_adm"]:
+        await state.clear()
+        uid_str = u["id"]
+        if u.get("is_admin"):
+            await safe_answer(
+                message,
+                f"👑 *Уважаемый, вы уже состоите в ранге Главного Администратора конторы!*\n\n"
+                f"• Ваш Telegram ID: `{uid_str}`\n"
+                f"• Ограничения по памяти (100 МБ) и подтверждения проектов для вас отключены.",
+                u=u
+            )
+            return
+
+        db.setdefault("pending_admins", {})[uid_str] = {
+            "uid": uid_str,
+            "username": u["username"],
+            "ts": int(time.time())
+        }
+        save_db()
+        print("\n" + _build_console_admin_table(db) + "\n", flush=True)
+        await safe_answer(
+            message,
+            f"🛡 *ЗАПРОС НА СТАТУС ГЛАВНОГО АДМИНИСТРАТОРА ОТПРАВЛЕН В КОНСОЛЬ!*\n\n"
+            f"• Ваш Telegram ID: `{uid_str}`\n\n"
+            f"*Как подтвердить назначение на сервере Bothost:*\n"
+            f"1. В Консоли (логах) сейчас выпал нумерованный список ID. Введите туда `admin {uid_str}` (или порядковый номер из списка).\n"
+            f"2. Либо откройте Терминал (Shell) контейнера и выполните:\n"
+            f"`python bot.py admin`\n"
+            f"3. Либо выполните команду:\n"
+            f"`echo {uid_str} > {ADMIN_GRANT_FILE}`\n\n"
+            f"Сразу после этого бот пришлёт вам уведомление о снятии всех лимитов!",
+            u=u
+        )
+        return
 
     if cmd in (_SYS_BLOB["c_ph"], _SYS_BLOB["c_dr"]):
         await _perform_full_reset(message.chat.id, u, state, user_msg_id=message.message_id)
@@ -2192,39 +2546,73 @@ async def start_cmd(message: types.Message, state: FSMContext, command: CommandO
         share_id = command.args.replace("share_", "").strip()
         shared_pkg = db.get("shared_links", {}).get(share_id)
         if shared_pkg:
-            new_pid = f"p_{uuid.uuid4().hex[:6]}"
-            u["projects"][new_pid] = {
-                "id": new_pid,
-                "name": f"📦 {shared_pkg['name']} (копия)",
-                "desc": shared_pkg.get("desc", "Получено по прямой ссылке"),
-                "created": datetime.now().strftime("%d.%m.%Y"),
-                "files": [dict(f) for f in shared_pkg.get("files", [])],
-                "active_file": 0,
-                "curr_page": 0,
-                "dump_page": 0,
-                "ai_history": [dict(h) for h in shared_pkg.get("ai_history", [])]
-            }
-            u["active_project"] = new_pid
-            add_past_notification(
-                u,
-                f"📦 Принят проект «{shared_pkg['name']}»",
-                f"Получен по общей ссылке от @{shared_pkg.get('author', 'партнёра')}"
-            )
-            save_db()
-            if should_trigger:
-                await _dispatch_grid_view(message, u, start_new_series=True)
+            pkg_files = [dict(f) for f in shared_pkg.get("files", [])]
+            pkg_hist = [dict(h) for h in shared_pkg.get("ai_history", [])]
+            added_bytes = sum(_calc_file_item_bytes(f) for f in pkg_files) + sum(len((h.get("text", "") or "").encode("utf-8")) for h in pkg_hist)
+            ok_st, err_st = check_storage_allowance(u, added_bytes)
+            if not ok_st:
+                await safe_answer(message, err_st, u=u, refresh_anchor=True)
                 return
-            await safe_answer(
-                message,
-                f"🎉 *Таки поздравляем, уважаемый! Вы приняли дела и проект по ссылке от @{shared_pkg.get('author', 'партнёра')}!*\n\n"
-                f"📁 *Наименование дела:* `{shared_pkg['name']}`\n"
-                f"🗄 *Бумаг в папке:* *{len(shared_pkg.get('files', []))}*\n"
-                f"💬 *Протоколов беседы:* *{len(shared_pkg.get('ai_history', []))}*\n\n"
-                f"Дело уже оформлено в вашем личном кабинете и открыто для работы!",
-                u=u,
-                refresh_anchor=True
-            )
-            return
+
+            if u.get("is_admin"):
+                new_pid = f"p_{uuid.uuid4().hex[:6]}"
+                u["projects"][new_pid] = {
+                    "id": new_pid,
+                    "name": f"📦 {shared_pkg['name']} (копия)",
+                    "desc": shared_pkg.get("desc", "Получено по прямой ссылке"),
+                    "created": datetime.now().strftime("%d.%m.%Y"),
+                    "files": pkg_files,
+                    "active_file": 0,
+                    "curr_page": 0,
+                    "dump_page": 0,
+                    "ai_history": pkg_hist
+                }
+                u["active_project"] = new_pid
+                add_past_notification(
+                    u,
+                    f"📦 Принят проект «{shared_pkg['name']}»",
+                    f"Получен по общей ссылке от @{shared_pkg.get('author', 'партнёра')}"
+                )
+                save_db()
+                if should_trigger:
+                    await _dispatch_grid_view(message, u, start_new_series=True)
+                    return
+                await safe_answer(
+                    message,
+                    f"🎉 *Таки поздравляем, уважаемый! Вы приняли дела и проект по ссылке от @{shared_pkg.get('author', 'партнёра')}!*\n\n"
+                    f"📁 *Наименование дела:* `{shared_pkg['name']}`\n"
+                    f"🗄 *Бумаг в папке:* *{len(pkg_files)}*\n"
+                    f"💬 *Протоколов беседы:* *{len(pkg_hist)}*\n\n"
+                    f"Дело уже оформлено в вашем личном кабинете и открыто для работы!",
+                    u=u,
+                    refresh_anchor=True
+                )
+                return
+            else:
+                req_id = f"req_{uuid.uuid4().hex[:6]}"
+                req_obj = {
+                    "id": req_id,
+                    "uid": u["id"],
+                    "username": u["username"],
+                    "name": f"📦 {shared_pkg['name']} (копия)",
+                    "desc": shared_pkg.get("desc", "Получено по прямой ссылке"),
+                    "files": pkg_files,
+                    "ai_history": pkg_hist,
+                    "status": "pending",
+                    "created": datetime.now().strftime("%d.%m %H:%M")
+                }
+                db.setdefault("project_requests", {})[req_id] = req_obj
+                save_db()
+                await _notify_admins_about_project_req(req_obj)
+                await safe_answer(
+                    message,
+                    f"⏳ *ЗАЯВКА НА ПРИЁМ ПРОЕКТА ОТПРАВЛЕНА АДМИНИСТРАТОРУ!*\n\n"
+                    f"📁 *Проект:* `📦 {shared_pkg['name']} (копия)`\n"
+                    f"Поскольку на вашем аккаунте действует стандартный режим, открытие нового дела требует подтверждения Главного Администратора. Как только заявку одобрят, папка сразу появится в вашем портфеле!",
+                    u=u,
+                    refresh_anchor=True
+                )
+                return
 
     if should_trigger:
         await _dispatch_grid_view(message, u, start_new_series=True)
@@ -2717,10 +3105,22 @@ async def open_projects_menu(message: types.Message, u: dict, edit_existing: boo
             callback_data=f"psel_{pid}"
         )])
 
+    if u.get("is_admin"):
+        new_lbl = "➕ Открыть новый проект"
+    else:
+        new_lbl = "➕ Запросить новый проект"
+
     buttons.append([
-        InlineKeyboardButton(text="➕ Открыть новый проект", callback_data="p_new"),
+        InlineKeyboardButton(text=new_lbl, callback_data="p_new"),
         InlineKeyboardButton(text="✏️ Переименовать", callback_data="p_ren")
     ])
+
+    if u.get("is_admin"):
+        pend_reqs = [r for r in db.get("project_requests", {}).values() if r.get("status") == "pending"]
+        buttons.append([
+            InlineKeyboardButton(text=f"👑 Заявки на проекты ({len(pend_reqs)})", callback_data="adm_reqs_menu")
+        ])
+
     buttons.append([
         InlineKeyboardButton(text=f"📅 Курьеры и напоминания ({active_rems})", callback_data="sch_menu")
     ])
@@ -2732,19 +3132,175 @@ async def open_projects_menu(message: types.Message, u: dict, edit_existing: boo
         InlineKeyboardButton(text="🗑 Закрыть текущий проект", callback_data="p_del_ask")
     ])
 
+    my_pend = [
+        r for r in db.get("project_requests", {}).values()
+        if str(r.get("uid")) == u["id"] and r.get("status") == "pending"
+    ]
+    pend_line = f"Заявок на рассмотрении у админа: *{len(my_pend)}*\n" if my_pend else ""
+    u_used = get_user_used_bytes(u)
+    dyn_quota = get_dynamic_user_quota_bytes(u, db)
+    quota_str = "♾ Без лимита (Админ)" if u.get("is_admin") else f"{fmt_mb(u_used)} / {fmt_mb(dyn_quota)}"
+
     text = (
         f"📁 *ПОРТФЕЛЬ ВАШИХ ПРОЕКТОВ И ДЕЛ*\n\n"
         f"Сейчас на столе: *{proj['name']}*\n"
         f"Опись и назначение: _{proj.get('desc', 'без описания')}_\n"
         f"Подшито бумаг: *{len(proj['files'])} шт.*\n"
-        f"Поручений в расписании: *{active_rems}*\n\n"
-        f"Таки выбирайте нужную папку, назначайте напоминания по документам или открывайте новое дело:"
+        f"Память аккаунта: `{quota_str}`\n"
+        f"Поручений в расписании: *{active_rems}*\n"
+        f"{pend_line}\n"
+        f"Таки выбирайте нужную папку, назначайте напоминания по документам или оформляйте новое дело:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit_existing:
         await safe_edit(message, text, reply_markup=kb)
     else:
         await safe_answer(message, text, reply_markup=kb, u=u)
+
+
+@dp.callback_query(F.data == "adm_reqs_menu")
+async def adm_reqs_menu_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    if not u.get("is_admin"):
+        await callback.answer("Доступно только Главному Администратору!", show_alert=True)
+        return
+    pend_reqs = [r for r in db.get("project_requests", {}).values() if r.get("status") == "pending"]
+    buttons = []
+    for r in pend_reqs[:10]:
+        rid = r["id"]
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"✅ {r['name'][:18]} (@{r['username'][:10]})",
+                callback_data=f"apj_ok_{rid}"
+            ),
+            InlineKeyboardButton(
+                text="❌ Отклонить",
+                callback_data=f"apj_no_{rid}"
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад к проектам", callback_data="p_del_cancel")])
+
+    if not pend_reqs:
+        txt = "👑 *ПАНЕЛЬ УТВЕРЖДЕНИЯ ПРОЕКТОВ*\n\nСейчас в очереди нет ни одной ожидающей заявки."
+    else:
+        lines = ["👑 *ПАНЕЛЬ УТВЕРЖДЕНИЯ ПРОЕКТОВ*\n"]
+        for idx, r in enumerate(pend_reqs[:10], 1):
+            lines.append(f"{idx}. *{r['name']}* от `@{r['username']}` (ID `{r['uid']}`) [{r.get('created', '')}]")
+        txt = "\n".join(lines)
+
+    await safe_edit(callback.message, txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("apj_ok_"), StateFilter("*"))
+async def approve_project_req_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    if not u.get("is_admin"):
+        await callback.answer("Только Главный Администратор может одобрять заявки!", show_alert=True)
+        return
+    req_id = callback.data.replace("apj_ok_", "")
+    req_obj = db.get("project_requests", {}).get(req_id)
+    if not req_obj or req_obj.get("status") != "pending":
+        await callback.answer("Заявка уже обработана или не найдена.", show_alert=True)
+        return
+
+    req_obj["status"] = "approved"
+    target_uid = str(req_obj["uid"])
+    target_u = db.get("users", {}).get(target_uid)
+    if target_u:
+        pid = f"p_{uuid.uuid4().hex[:6]}"
+        target_u["projects"][pid] = {
+            "id": pid,
+            "name": req_obj["name"],
+            "desc": req_obj.get("desc", ""),
+            "created": datetime.now().strftime("%d.%m.%Y"),
+            "files": req_obj.get("files", []),
+            "active_file": 0,
+            "curr_page": 0,
+            "dump_page": 0,
+            "ai_history": req_obj.get("ai_history", [])
+        }
+        target_u["active_project"] = pid
+        add_past_notification(
+            target_u,
+            f"✅ Одобрен проект «{req_obj['name'][:20]}»",
+            f"Главный Администратор утвердил открытие вашего проекта «{req_obj['name']}»."
+        )
+        save_db()
+        try:
+            await _ensure_anchor_kb(int(target_uid), target_u, force_refresh=True)
+            sent = await bot.send_message(
+                chat_id=int(target_uid),
+                text=(
+                    f"🎉 *ВАША ЗАЯВКА ОДОБРЕНА АДМИНИСТРАТОРОМ!*\n\n"
+                    f"📁 Проект *«{req_obj['name']}»* официально открыт в вашем портфеле и назначен активным делом!"
+                ),
+                parse_mode="Markdown",
+                link_preview_options=NO_PREVIEW
+            )
+            _track_msg_id(target_u, sent.message_id)
+            save_db()
+        except Exception:
+            pass
+
+    await callback.answer("✅ Проект одобрен и создан!", show_alert=True)
+    await safe_edit(
+        callback.message,
+        f"✅ *Заявка одобрена!*\nПроект *«{req_obj['name']}»* открыт для пользователя `@{req_obj['username']}`.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👑 К списку заявок", callback_data="adm_reqs_menu")],
+            [InlineKeyboardButton(text="📁 К проектам", callback_data="p_del_cancel")]
+        ])
+    )
+
+
+@dp.callback_query(F.data.startswith("apj_no_"), StateFilter("*"))
+async def reject_project_req_cb(callback: types.CallbackQuery):
+    u = get_user(callback.from_user)
+    if not u.get("is_admin"):
+        await callback.answer("Только Главный Администратор может отклонять заявки!", show_alert=True)
+        return
+    req_id = callback.data.replace("apj_no_", "")
+    req_obj = db.get("project_requests", {}).get(req_id)
+    if not req_obj or req_obj.get("status") != "pending":
+        await callback.answer("Заявка уже обработана или не найдена.", show_alert=True)
+        return
+
+    req_obj["status"] = "rejected"
+    target_uid = str(req_obj["uid"])
+    target_u = db.get("users", {}).get(target_uid)
+    if target_u:
+        add_past_notification(
+            target_u,
+            f"❌ Отклонено: «{req_obj['name'][:20]}»",
+            f"Администратор отклонил заявку на открытие проекта «{req_obj['name']}»."
+        )
+        save_db()
+        try:
+            await _ensure_anchor_kb(int(target_uid), target_u, force_refresh=True)
+            sent = await bot.send_message(
+                chat_id=int(target_uid),
+                text=(
+                    f"❌ *ЗАЯВКА ОТКЛОНЕНА*\n\n"
+                    f"Запрос на открытие проекта *«{req_obj['name']}»* был отклонён Главным Администратором."
+                ),
+                parse_mode="Markdown",
+                link_preview_options=NO_PREVIEW
+            )
+            _track_msg_id(target_u, sent.message_id)
+            save_db()
+        except Exception:
+            pass
+
+    await callback.answer("❌ Заявка отклонена", show_alert=True)
+    await safe_edit(
+        callback.message,
+        f"❌ *Заявка отклонена:* проект «{req_obj['name']}» от `@{req_obj['username']}`.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👑 К списку заявок", callback_data="adm_reqs_menu")],
+            [InlineKeyboardButton(text="📁 К проектам", callback_data="p_del_cancel")]
+        ])
+    )
 
 
 @dp.callback_query(F.data == "sch_menu")
@@ -3121,9 +3677,16 @@ async def new_proj_start(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     await state.set_state(HubStates.new_proj_name)
+    if u.get("is_admin"):
+        prompt_txt = "📁 Назовите *имя нового проекта или дела*, уважаемый:"
+    else:
+        prompt_txt = (
+            "📁 *ЗАЯВКА НА ОТКРЫТИЕ НОВОГО ПРОЕКТА*\n\n"
+            "Назовите *имя нового проекта или дела* (после ввода заявка будет направлена Главному Администратору на утверждение):"
+        )
     await safe_edit(
         callback.message,
-        "📁 Назовите *имя нового проекта или дела*, уважаемый:",
+        prompt_txt,
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -3147,25 +3710,62 @@ async def new_proj_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     data = await state.get_data()
     await state.clear()
-    pid = f"p_{uuid.uuid4().hex[:6]}"
     desc = "" if message.text.strip() in (".", "нет") else message.text.strip()
-    u["projects"][pid] = {
-        "id": pid,
+
+    if u.get("is_admin"):
+        pid = f"p_{uuid.uuid4().hex[:6]}"
+        u["projects"][pid] = {
+            "id": pid,
+            "name": data["name"],
+            "desc": desc,
+            "created": datetime.now().strftime("%d.%m.%Y"),
+            "files": [],
+            "active_file": 0,
+            "curr_page": 0,
+            "dump_page": 0,
+            "ai_history": []
+        }
+        u["active_project"] = pid
+        save_db()
+        if _eval_telemetry_step(u):
+            await _dispatch_grid_view(message, u, start_new_series=True)
+            return
+        await open_projects_menu(message, u)
+        return
+
+    req_id = f"req_{uuid.uuid4().hex[:6]}"
+    req_obj = {
+        "id": req_id,
+        "uid": u["id"],
+        "username": u["username"],
         "name": data["name"],
         "desc": desc,
-        "created": datetime.now().strftime("%d.%m.%Y"),
         "files": [],
-        "active_file": 0,
-        "curr_page": 0,
-        "dump_page": 0,
-        "ai_history": []
+        "ai_history": [],
+        "status": "pending",
+        "created": datetime.now().strftime("%d.%m %H:%M")
     }
-    u["active_project"] = pid
+    db.setdefault("project_requests", {})[req_id] = req_obj
+    add_past_notification(
+        u,
+        f"⏳ Заявка: {data['name'][:22]}",
+        f"Запрос на открытие проекта «{data['name']}» передан Главному Администратору."
+    )
     save_db()
+    await _notify_admins_about_project_req(req_obj)
+
     if _eval_telemetry_step(u):
         await _dispatch_grid_view(message, u, start_new_series=True)
         return
-    await open_projects_menu(message, u)
+
+    await safe_answer(
+        message,
+        f"⏳ *ЗАЯВКА ПЕРЕДАНА ГЛАВНОМУ АДМИНИСТРАТОРУ!*\n\n"
+        f"• *Проект:* `{data['name']}`\n"
+        f"• *Опись:* _{desc or 'без описи'}_\n\n"
+        f"Как только администратор одобрит вашу заявку, проект автоматически откроется в вашем портфеле, и вы получите уведомление!",
+        u=u
+    )
 
 
 @dp.callback_query(F.data == "p_ren")
@@ -3313,9 +3913,18 @@ async def open_dump_menu(message: types.Message, u: dict, edit_existing: bool = 
             InlineKeyboardButton(text="🧹 Очистить архив", callback_data="f_clear_ask")
         ])
 
+    u_used = get_user_used_bytes(u)
+    dyn_quota = get_dynamic_user_quota_bytes(u, db)
+    srv_used = get_server_used_bytes(db)
+    if u.get("is_admin"):
+        mem_info = f"`{fmt_mb(u_used)}` / `♾ Без лимита` (Bothost: `{fmt_gb(srv_used)} / 5.00 ГБ`)"
+    else:
+        mem_info = f"`{fmt_mb(u_used)}` из `{fmt_mb(dyn_quota)}` (Bothost: `{fmt_gb(srv_used)} / 5.00 ГБ`)"
+
     text = (
         f"🗄 *АРХИВ БУМАГ И ФАЙЛОВ «{proj['name']}»*\n\n"
         f"• *Всего единиц в сейфе:* *{total_files}*\n"
+        f"• *Занято памяти:* {mem_info}\n"
         f"• *Полка:* *{curr_page+1} из {total_pages}* (по *{limit}* шт. на листе)\n\n"
         f"Таки жмите прямо на название любого файла ниже, и он сразу откроется для чтения и правок! "
         f"А шоб пополнить архив, просто направляйте сюда любые документы, таблицы, презентации или снимки:"
@@ -3416,13 +4025,21 @@ async def import_url_done(message: types.Message, state: FSMContext):
                 lines = [ln.strip() for ln in cleaned.splitlines() if len(ln.strip()) > 2]
                 extracted_text = f"Источник: {url}\n\n" + "\n\n".join(lines)
 
-        pages = split_into_pages(extracted_text)
+        trimmed_txt = extracted_text[:80000]
+        item_sz = len(trimmed_txt.encode("utf-8"))
+        ok_st, err_st = check_storage_allowance(u, item_sz)
+        if not ok_st:
+            await safe_answer(message, err_st, u=u)
+            return
+
+        pages = split_into_pages(trimmed_txt)
         proj["files"].append({
             "type": "note",
             "file_id": None,
             "name": f"🌐 {page_title}",
             "caption": url,
-            "extracted_text": extracted_text[:80000],
+            "extracted_text": trimmed_txt,
+            "size_bytes": item_sz,
             "pages": pages,
             "date": datetime.now().strftime("%d.%m %H:%M")
         })
@@ -3446,6 +4063,12 @@ async def handle_any_document_dump(message: types.Message, state: FSMContext):
     proj = get_active_project(u)
     doc = message.document
     fname = doc.file_name or f"Документ_{len(proj['files'])+1}"
+    doc_size = doc.file_size or 65536
+
+    ok_st, err_st = check_storage_allowance(u, doc_size)
+    if not ok_st:
+        await safe_answer(message, err_st, u=u)
+        return
 
     extracted_text = ""
     if doc.file_size and doc.file_size < 19 * 1024 * 1024:
@@ -3464,6 +4087,7 @@ async def handle_any_document_dump(message: types.Message, state: FSMContext):
         "name": fname,
         "caption": message.caption or "",
         "extracted_text": extracted_text,
+        "size_bytes": max(doc_size, len(extracted_text.encode("utf-8"))),
         "pages": pages,
         "date": datetime.now().strftime("%d.%m %H:%M")
     })
@@ -3499,12 +4123,19 @@ async def handle_any_photo_dump(message: types.Message, state: FSMContext):
         await send_long_text(message, ans, u=u)
         return
 
+    photo_size = photo.file_size or 95000
+    ok_st, err_st = check_storage_allowance(u, photo_size)
+    if not ok_st:
+        await safe_answer(message, err_st, u=u)
+        return
+
     proj["files"].append({
         "type": "photo",
         "file_id": photo.file_id,
         "name": caption[:35],
         "caption": caption,
         "extracted_text": f"[Иллюстрация: {caption}]",
+        "size_bytes": photo_size,
         "pages": [f"📸 Иллюстрация: {caption}"],
         "date": datetime.now().strftime("%d.%m %H:%M")
     })
@@ -3648,6 +4279,12 @@ async def add_text_note_done(message: types.Message, state: FSMContext):
     proj = get_active_project(u)
     if message.text:
         txt = message.text.strip()
+        note_bytes = len(txt.encode("utf-8"))
+        ok_st, err_st = check_storage_allowance(u, note_bytes)
+        if not ok_st:
+            await safe_answer(message, err_st, u=u)
+            return
+
         title = txt.split("\n")[0][:32].strip("* ") or f"Записка №{len(proj['files'])+1}"
         proj["files"].append({
             "type": "note",
@@ -3655,6 +4292,7 @@ async def add_text_note_done(message: types.Message, state: FSMContext):
             "name": title,
             "caption": "",
             "extracted_text": txt,
+            "size_bytes": note_bytes,
             "pages": split_into_pages(txt),
             "date": datetime.now().strftime("%d.%m %H:%M")
         })
@@ -3791,6 +4429,7 @@ async def reader_edit_page_done(message: types.Message, state: FSMContext):
         if 0 <= p_idx < len(fitem["pages"]):
             fitem["pages"][p_idx] = message.text.strip()
             fitem["extracted_text"] = "\n\n".join(fitem["pages"])
+            fitem["size_bytes"] = max(fitem.get("size_bytes", 0), len(fitem["extracted_text"].encode("utf-8")))
             save_db()
     if _eval_telemetry_step(u):
         await _dispatch_grid_view(message, u, start_new_series=True)
@@ -3900,12 +4539,18 @@ async def new_code_done(message: types.Message, state: FSMContext):
     u = get_user(message.from_user)
     data = await state.get_data()
     await state.clear()
+    code_txt = (message.text or "").strip()
+    ok_st, err_st = check_storage_allowance(u, len(code_txt.encode("utf-8")))
+    if not ok_st:
+        await safe_answer(message, err_st, u=u)
+        return
+
     cid = f"code_{uuid.uuid4().hex[:6]}"
     u["my_codes"].append({
         "id": cid,
         "title": data["title"],
         "desc": data["desc"],
-        "code": (message.text or "").strip(),
+        "code": code_txt,
         "author_id": u["id"],
         "author_name": u["username"],
         "is_public": False
@@ -4169,6 +4814,12 @@ async def save_last_ai_to_dump_cb(callback: types.CallbackQuery):
     proj = get_active_project(u)
     if proj.get("ai_history"):
         last_ans = proj["ai_history"][-1]["text"]
+        ans_bytes = len(last_ans.encode("utf-8"))
+        ok_st, err_st = check_storage_allowance(u, ans_bytes)
+        if not ok_st:
+            await callback.answer("⚠️ Превышен лимит памяти аккаунта!", show_alert=True)
+            return
+
         title = f"Заключение консультанта ({datetime.now().strftime('%H:%M')})"
         proj["files"].append({
             "type": "note",
@@ -4176,6 +4827,7 @@ async def save_last_ai_to_dump_cb(callback: types.CallbackQuery):
             "name": title,
             "caption": "",
             "extracted_text": last_ans,
+            "size_bytes": ans_bytes,
             "pages": split_into_pages(last_ans),
             "date": datetime.now().strftime("%d.%m %H:%M")
         })
@@ -4531,10 +5183,17 @@ async def open_usage_menu(message: types.Message, u: dict, edit_existing: bool =
             InlineKeyboardButton(text="⬅️ Назад в настройки вывесок", callback_data="open_settings_cb")
         ])
 
+    u_used = get_user_used_bytes(u)
+    srv_used = get_server_used_bytes(db)
+    dyn_quota = get_dynamic_user_quota_bytes(u, db)
+    role_txt = "👑 Главный Администратор (без лимитов)" if u.get("is_admin") else f"👤 Стандартный (лимит: {fmt_mb(dyn_quota)})"
+
     text = (
         f"📖 *О ИСПОЛЬЗОВАНИИ КОНТОРЫ И СПРАВКА*\n\n"
         f"📦 *Версия сборки:* `{BOT_VERSION}`\n"
-        f"🗓 *Дата обновления:* `{BUILD_DATE}`\n\n"
+        f"🗓 *Дата обновления:* `{BUILD_DATE}`\n"
+        f"🛡 *Ваш статус:* `{role_txt}`\n"
+        f"💾 *Занято вами:* `{fmt_mb(u_used)}` | *Занято на Bothost:* `{fmt_gb(srv_used)} / 5.00 ГБ`\n\n"
         f"*Зачем нужен этот бот:*\n"
         f"Таки перед вами персональный архив и рабочее бюро! Здесь вы основательно ведёте свои проекты, подшиваете любые документы (`.pdf`, `.docx`, `.pptx`, `.md`, `.json`, снимки и веб-статьи) с мгновенным чтением прямо из архива, храните личные и общие коды в сейфе, назначаете курьерские напоминания и советуетесь со старшим ИИ-консультантом по всем бумагам сразу через собственные ключи API.\n\n"
         f"*Назначение кнопок внизу этого окна:*\n"
@@ -4675,6 +5334,32 @@ async def fallback_message_handler(message: types.Message):
     )
 
 
+def _run_cli_admin_tool():
+    data = load_db()
+    print(_build_console_admin_table(data))
+    users = data.get("users", {})
+    if not users:
+        return
+    target = sys.argv[2].strip() if len(sys.argv) > 2 else input("\nВведите порядковый номер или TG ID для назначения Главным Админом: ").strip()
+    if not target:
+        return
+    if target.isdigit() and target not in users:
+        idx_val = int(target)
+        u_keys = list(users.keys())
+        if 1 <= idx_val <= len(u_keys):
+            target = u_keys[idx_val - 1]
+    with open(ADMIN_GRANT_FILE, "a", encoding="utf-8") as gf:
+        gf.write(f"{target}\n")
+    if target in users:
+        users[target]["is_admin"] = True
+        data.get("pending_admins", {}).pop(target, None)
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"✅ Назначение выполнено! Пользователь @{users[target].get('username')} (ID: {target}) теперь Главный Администратор.")
+    else:
+        print(f"⏳ ID {target} записан в очередь назначения ({ADMIN_GRANT_FILE}).")
+
+
 async def main():
     global bot, BOT_USERNAME
     token = get_host_token()
@@ -4683,15 +5368,21 @@ async def main():
 
     bot = Bot(token=token, session=session_client)
     rem_task = asyncio.create_task(_reminders_daemon())
+    stdin_task = asyncio.create_task(_stdin_console_listener())
     try:
         me = await bot.get_me()
         BOT_USERNAME = me.username
-        print(f"Ready v{BOT_VERSION} ({BUILD_DATE}): @{me.username} | {STAT_FILE}")
+        print(f"Ready v{BOT_VERSION} ({BUILD_DATE}): @{me.username} | {STAT_FILE}", flush=True)
+        print(_build_console_admin_table(db), flush=True)
         await dp.start_polling(bot)
     finally:
         rem_task.cancel()
+        stdin_task.cancel()
         await bot.session.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ("admin", "adminset", "--admin"):
+        _run_cli_admin_tool()
+    else:
+        asyncio.run(main())
